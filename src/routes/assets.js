@@ -1,11 +1,188 @@
 // src/routes/assets.js
 import express from 'express';
-import { pool } from '../db.js';
+import multer from 'multer';
+import { basename } from 'node:path';
+import { pool, withTenantContext } from '../db.js';
 import { authenticateToken } from '../middlewares/auth.js';
+import {
+  createAssetDocumentSignedUrl,
+  removeAssetDocument,
+  uploadAssetDocument,
+} from '../services/storage.js';
 
 const router = express.Router();
+const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
+const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+const ASSET_ID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_DOCUMENT_SIZE_BYTES, files: 1 },
+  fileFilter(req, file, callback) {
+    if (ALLOWED_DOCUMENT_MIME_TYPES.has(file.mimetype)) {
+      return callback(null, true);
+    }
+
+    const error = new Error('Tipo de arquivo não permitido.');
+    error.code = 'UNSUPPORTED_FILE_TYPE';
+    return callback(error);
+  },
+});
 
 router.use(authenticateToken);
+
+function handleDocumentUpload(req, res, next) {
+  documentUpload.single('file')(req, res, (error) => {
+    if (!error) return next();
+
+    if (error instanceof multer.MulterError) {
+      const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ error: error.message });
+    }
+
+    if (error.code === 'UNSUPPORTED_FILE_TYPE') {
+      return res.status(415).json({ error: error.message });
+    }
+
+    return next(error);
+  });
+}
+
+function getSafeDocumentName(originalName) {
+  const name = basename(originalName.replaceAll('\\', '/'))
+    .replace(/[^\p{L}\p{N}._-]/gu, '_')
+    .slice(0, 200);
+
+  return name && name !== '.' && name !== '..' ? name : 'document';
+}
+
+function requireTenant(req, res, next) {
+  if (!req.user.tenantId) {
+    return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+  }
+  return next();
+}
+
+function validateAssetId(req, res, next) {
+  if (!ASSET_ID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do ativo inválido.' });
+  }
+  return next();
+}
+
+router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUpload, async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'O ficheiro é obrigatório.' });
+  }
+  if (req.file.size === 0) {
+    return res.status(400).json({ error: 'O ficheiro não pode estar vazio.' });
+  }
+
+  const storagePath = `${req.user.tenantId}/${req.params.id}/${Date.now()}-${getSafeDocumentName(req.file.originalname)}`;
+  let uploaded = false;
+
+  try {
+    await uploadAssetDocument(storagePath, req.file);
+    uploaded = true;
+
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `INSERT INTO public.asset_documents (
+           tenant_id, asset_id, document_type, title, file_url, file_name,
+           storage_path, mime_type, file_size_bytes, uploaded_by
+         )
+         SELECT $1, assets.id, $3, $4, $5, $4, $6, $7, $8, $9
+         FROM public.assets AS assets
+         WHERE assets.id = $2
+           AND assets.tenant_id = $1
+           AND assets.deleted_at IS NULL
+         RETURNING id, tenant_id, asset_id, document_type, title, file_name,
+                   mime_type, file_size_bytes, created_at`,
+        [
+          req.user.tenantId,
+          req.params.id,
+          req.file.mimetype === 'application/pdf' ? 'tech_sheet' : 'asset_photo',
+          getSafeDocumentName(req.file.originalname),
+          storagePath,
+          storagePath,
+          req.file.mimetype,
+          req.file.size,
+          req.user.id,
+        ],
+      ),
+    );
+
+    if (result.rows.length === 0) {
+      await removeAssetDocument(storagePath);
+      uploaded = false;
+      return res.status(404).json({ error: 'Ativo não encontrado.' });
+    }
+
+    return res.status(201).json({ document: result.rows[0] });
+  } catch (error) {
+    if (uploaded) {
+      try {
+        await removeAssetDocument(storagePath);
+      } catch (cleanupError) {
+        console.error('Erro ao remover ficheiro após falha no registo:', cleanupError);
+      }
+    }
+
+    console.error('Erro ao carregar documento do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao carregar documento do ativo.' });
+  }
+});
+
+router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) => {
+  try {
+    const documents = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const assetResult = await client.query(
+        `SELECT id
+         FROM public.assets
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL`,
+        [req.params.id, req.user.tenantId],
+      );
+
+      if (assetResult.rows.length === 0) return null;
+
+      const documentResult = await client.query(
+        `SELECT id, tenant_id, asset_id, document_type, title, file_name,
+                storage_path, mime_type, file_size_bytes, created_at
+         FROM public.asset_documents
+         WHERE asset_id = $1
+           AND tenant_id = $2
+           AND storage_path IS NOT NULL
+         ORDER BY created_at DESC`,
+        [req.params.id, req.user.tenantId],
+      );
+
+      return documentResult.rows;
+    });
+
+    if (documents === null) {
+      return res.status(404).json({ error: 'Ativo não encontrado.' });
+    }
+
+    const documentsWithUrls = await Promise.all(
+      documents.map(async ({ storage_path: storagePath, ...document }) => ({
+        ...document,
+        signed_url: await createAssetDocumentSignedUrl(storagePath),
+      })),
+    );
+
+    return res.json({ documents: documentsWithUrls });
+  } catch (error) {
+    console.error('Erro ao listar documentos do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao listar documentos do ativo.' });
+  }
+});
 
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', async (req, res) => {
