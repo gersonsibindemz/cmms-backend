@@ -1,11 +1,11 @@
 // src/routes/assets.js
 import express from 'express';
 import { pool } from '../db.js';
-import { requireAuth } from '../middlewares/auth.js';
+import { authenticateToken } from '../middlewares/auth.js';
 
 const router = express.Router();
 
-router.use(requireAuth);
+router.use(authenticateToken);
 
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', async (req, res) => {
