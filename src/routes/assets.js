@@ -218,9 +218,10 @@ router.get('/', async (req, res) => {
         created_at
       FROM public.assets
       WHERE deleted_at IS NULL
+        AND tenant_id = $1
       ORDER BY created_at DESC;
     `;
-    const { rows } = await pool.query(query);
+    const { rows } = await pool.query(query, [req.user.tenantId]);
     res.json({ assets: rows });
   } catch (error) {
     console.error('Erro ao listar ativos:', error);
@@ -233,8 +234,8 @@ router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(
-      'SELECT * FROM public.assets WHERE id = $1 AND deleted_at IS NULL;',
-      [id]
+      'SELECT * FROM public.assets WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2;',
+      [id, req.user.tenantId]
     );
 
     if (rows.length === 0) {
@@ -351,7 +352,7 @@ router.put('/:id', async (req, res) => {
         warranty_expiry = COALESCE($23, warranty_expiry),
         technical_specs = COALESCE($24, technical_specs),
         updated_at = NOW()
-      WHERE id = $25 AND deleted_at IS NULL
+      WHERE id = $25 AND deleted_at IS NULL AND tenant_id = $26
       RETURNING *;
     `;
 
@@ -363,7 +364,7 @@ router.put('/:id', async (req, res) => {
       plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
       pressureTestExpiry, localSupplierName, warrantyExpiry,
       technicalSpecs ? JSON.stringify(technicalSpecs) : null,
-      id
+      id, req.user.tenantId
     ];
 
     const { rows } = await pool.query(updateQuery, values);
@@ -383,8 +384,8 @@ router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(
-      'UPDATE public.assets SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id, code_tag;',
-      [id]
+      'UPDATE public.assets SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2 RETURNING id, code_tag;',
+      [id, req.user.tenantId]
     );
 
     if (rows.length === 0) {
