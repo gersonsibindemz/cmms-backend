@@ -9,6 +9,7 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
+  console.log('>>> [CMMS API] Tentativa de login para o email:', email);
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email e senha são obrigatórios.' });
