@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
+import { basename } from 'node:path';
 
 const BUCKET_NAME = 'asset-documents';
-const SIGNED_URL_EXPIRY_SECONDS = 60 * 60;
 
 let supabaseClient;
 
@@ -23,34 +23,41 @@ function getSupabaseClient() {
   return supabaseClient;
 }
 
-export async function uploadAssetDocument(storagePath, file) {
-  const { data, error } = await getSupabaseClient()
+function sanitizeFileName(fileName) {
+  return basename(fileName.replaceAll('\\', '/'))
+    .replace(/[^\p{L}\p{N}._-]/gu, '_')
+    .slice(0, 200) || 'document';
+}
+
+export async function uploadAssetFile(tenantId, assetId, fileBuffer, fileName, mimeType) {
+  const storagePath = `${tenantId}/${assetId}/${Date.now()}-${sanitizeFileName(fileName)}`;
+  const { error } = await getSupabaseClient()
     .storage
     .from(BUCKET_NAME)
-    .upload(storagePath, file.buffer, {
-      contentType: file.mimetype,
+    .upload(storagePath, fileBuffer, {
+      contentType: mimeType,
       upsert: false,
     });
 
   if (error) throw error;
-  return data.path;
+  return storagePath;
 }
 
-export async function createAssetDocumentSignedUrl(storagePath) {
+export async function getSignedFileUrl(filePath, expiresInSeconds = 3600) {
   const { data, error } = await getSupabaseClient()
     .storage
     .from(BUCKET_NAME)
-    .createSignedUrl(storagePath, SIGNED_URL_EXPIRY_SECONDS);
+    .createSignedUrl(filePath, expiresInSeconds);
 
   if (error) throw error;
   return data.signedUrl;
 }
 
-export async function removeAssetDocument(storagePath) {
+export async function removeAssetFile(filePath) {
   const { error } = await getSupabaseClient()
     .storage
     .from(BUCKET_NAME)
-    .remove([storagePath]);
+    .remove([filePath]);
 
   if (error) throw error;
 }

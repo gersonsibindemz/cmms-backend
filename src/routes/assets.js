@@ -5,9 +5,9 @@ import { basename } from 'node:path';
 import { pool, withTenantContext } from '../db.js';
 import { authenticateToken } from '../middlewares/auth.js';
 import {
-  createAssetDocumentSignedUrl,
-  removeAssetDocument,
-  uploadAssetDocument,
+  getSignedFileUrl,
+  removeAssetFile,
+  uploadAssetFile,
 } from '../services/storage.js';
 
 const router = express.Router();
@@ -19,6 +19,14 @@ const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
   'image/webp',
 ]);
 const ASSET_ID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const DOCUMENT_TYPES = new Set([
+  'tech_sheet',
+  'manual',
+  'diagram',
+  'inspection_certificate',
+  'insurance',
+  'asset_photo',
+]);
 
 const documentUpload = multer({
   storage: multer.memoryStorage(),
@@ -82,12 +90,24 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
   if (req.file.size === 0) {
     return res.status(400).json({ error: 'O ficheiro não pode estar vazio.' });
   }
+  const documentType = typeof req.body.documentType === 'string' ? req.body.documentType.trim() : '';
+  const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+  if (!DOCUMENT_TYPES.has(documentType) || !title || title.length > 255) {
+    return res.status(400).json({ error: 'Tipo de documento ou título inválido.' });
+  }
 
-  const storagePath = `${req.user.tenantId}/${req.params.id}/${Date.now()}-${getSafeDocumentName(req.file.originalname)}`;
+  const fileName = getSafeDocumentName(req.file.originalname);
   let uploaded = false;
+  let storagePath;
 
   try {
-    await uploadAssetDocument(storagePath, req.file);
+    storagePath = await uploadAssetFile(
+      req.user.tenantId,
+      req.params.id,
+      req.file.buffer,
+      fileName,
+      req.file.mimetype,
+    );
     uploaded = true;
 
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
@@ -96,20 +116,20 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
            tenant_id, asset_id, document_type, title, file_url, file_name,
            storage_path, mime_type, file_size_bytes, uploaded_by
          )
-         SELECT $1, assets.id, $3, $4, $5, $4, $6, $7, $8, $9
+         SELECT $1, assets.id, $3, $4, $5, $6, $5, $7, $8, $9
          FROM public.assets AS assets
          WHERE assets.id = $2
            AND assets.tenant_id = $1
            AND assets.deleted_at IS NULL
          RETURNING id, tenant_id, asset_id, document_type, title, file_name,
-                   mime_type, file_size_bytes, created_at`,
+                   file_url, mime_type, file_size_bytes, uploaded_by, created_at`,
         [
           req.user.tenantId,
           req.params.id,
-          req.file.mimetype === 'application/pdf' ? 'tech_sheet' : 'asset_photo',
-          getSafeDocumentName(req.file.originalname),
+          documentType,
+          title,
           storagePath,
-          storagePath,
+          fileName,
           req.file.mimetype,
           req.file.size,
           req.user.id,
@@ -118,16 +138,16 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
     );
 
     if (result.rows.length === 0) {
-      await removeAssetDocument(storagePath);
+      await removeAssetFile(storagePath);
       uploaded = false;
       return res.status(404).json({ error: 'Ativo não encontrado.' });
     }
 
     return res.status(201).json({ document: result.rows[0] });
   } catch (error) {
-    if (uploaded) {
+    if (uploaded && storagePath) {
       try {
-        await removeAssetDocument(storagePath);
+        await removeAssetFile(storagePath);
       } catch (cleanupError) {
         console.error('Erro ao remover ficheiro após falha no registo:', cleanupError);
       }
@@ -173,7 +193,7 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
     const documentsWithUrls = await Promise.all(
       documents.map(async ({ storage_path: storagePath, ...document }) => ({
         ...document,
-        signed_url: await createAssetDocumentSignedUrl(storagePath),
+        signed_url: await getSignedFileUrl(storagePath),
       })),
     );
 
