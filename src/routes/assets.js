@@ -1,8 +1,9 @@
 // src/routes/assets.js
-const express = require('express');
+import express from 'express';
+import pool from '../db.js';
+import { requireAuth } from '../middlewares/auth.js';
+
 const router = express.Router();
-const pool = require('../db');
-const { requireAuth } = require('../middlewares/auth');
 
 router.use(requireAuth);
 
@@ -56,10 +57,8 @@ router.post('/', async (req, res) => {
     const {
       codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
       currentMeter, meterKind, costCenter,
-      // Frota
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
-      // Fabril
       plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
       pressureTestExpiry, localSupplierName, warrantyExpiry, technicalSpecs
     } = req.body;
@@ -68,7 +67,6 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
     }
 
-    // Se o utilizador não forneceu código manual, gera via função SQL do banco
     let finalCodeTag = codeTag;
     if (!finalCodeTag || finalCodeTag.trim() === '') {
       const codeRes = await pool.query(
@@ -203,4 +201,4 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
