@@ -1,6 +1,6 @@
 // src/routes/assets.js
 import express from 'express';
-import pool from '../db.js';
+import { pool } from '../db.js';
 import { requireAuth } from '../middlewares/auth.js';
 
 const router = express.Router();
