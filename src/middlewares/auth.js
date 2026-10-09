@@ -11,7 +11,7 @@ export function authenticateToken(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
 
     req.user = {
-      id: payload.id,
+      id: payload.id ?? payload.userId,
       tenantId: payload.tenantId,
       role: payload.role,
       fullName: payload.fullName,

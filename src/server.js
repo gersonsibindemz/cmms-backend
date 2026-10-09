@@ -7,6 +7,7 @@ import superAdminRoutes from './routes/superAdmin.js';
 import assetRoutes from './routes/assets.js';
 import fuelLogRoutes from './routes/fuelLogs.js';
 import workOrderRoutes from './routes/workOrders.js';
+import technicianRoutes from './routes/technicians.js';
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/assets', assetRoutes);
 app.use('/api/fuel', fuelLogRoutes);
 app.use('/api/work-orders', workOrderRoutes);
+app.use('/api/technicians', technicianRoutes);
 
 const port = process.env.PORT ? Number(process.env.PORT) : 4000;
 app.listen(port, () => {

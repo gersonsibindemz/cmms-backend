@@ -6,7 +6,7 @@ const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const ORDER_TYPES = new Set(['corrective', 'preventive', 'inspection']);
 const PRIORITIES = new Set(['low', 'medium', 'high', 'urgent']);
-const STATUSES = new Set(['open', 'in_progress', 'waiting_parts', 'completed', 'cancelled']);
+const STATUSES = new Set(['open', 'in_progress', 'waiting_parts', 'blocked', 'completed', 'cancelled']);
 
 router.use(authenticateToken);
 
@@ -98,6 +98,159 @@ router.get('/:id', requireTenant, async (req, res, next) => {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
     }
     return res.json({ workOrder: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/:id/transitions', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  const { eventType, reason, justification, meterAtService } = req.body ?? {};
+  const transition = {
+    start: { status: 'in_progress', allowedFrom: ['open', 'assigned'] },
+    pause: { status: 'waiting_parts', allowedFrom: ['in_progress'] },
+    resume: { status: 'in_progress', allowedFrom: ['waiting_parts', 'blocked'] },
+    interrupt: { status: 'blocked', allowedFrom: ['in_progress'] },
+    complete: { status: 'completed', allowedFrom: ['in_progress', 'waiting_parts', 'blocked'] },
+  }[eventType];
+
+  if (!transition) {
+    return res.status(400).json({ message: 'Tipo de transição inválido.' });
+  }
+  if (
+    (eventType === 'pause' || eventType === 'interrupt') &&
+    (typeof reason !== 'string' || !reason.trim() ||
+      typeof justification !== 'string' || !justification.trim())
+  ) {
+    return res.status(400).json({
+      message: 'Motivo e justificação são obrigatórios para pausar ou interromper a ordem de serviço.',
+    });
+  }
+  if (
+    (reason !== undefined && reason !== null && typeof reason !== 'string') ||
+    (justification !== undefined && justification !== null && typeof justification !== 'string') ||
+    (meterAtService !== undefined && meterAtService !== null && (
+      typeof meterAtService !== 'number' || !Number.isFinite(meterAtService) || meterAtService < 0
+    ))
+  ) {
+    return res.status(400).json({ message: 'Dados da transição inválidos.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id, status
+         FROM public.work_orders
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+         FOR UPDATE`,
+        [req.params.id, req.user.tenantId],
+      );
+      const order = orderResult.rows[0];
+      if (!order) return { notFound: true };
+      if (!transition.allowedFrom.includes(order.status)) {
+        return { invalidTransition: true, currentStatus: order.status };
+      }
+
+      await client.query(
+        `UPDATE public.work_orders
+         SET status = $1,
+             started_at = CASE
+               WHEN $1 = 'in_progress' AND $4 = 'start' THEN COALESCE(started_at, NOW())
+               ELSE started_at
+             END,
+             completed_at = CASE
+               WHEN $1 = 'completed' THEN NOW()
+               ELSE completed_at
+             END,
+             meter_at_service = COALESCE($5, meter_at_service),
+             updated_at = NOW()
+         WHERE id = $2
+           AND tenant_id = $3
+           AND deleted_at IS NULL`,
+        [
+          transition.status,
+          req.params.id,
+          req.user.tenantId,
+          eventType,
+          meterAtService ?? null,
+        ],
+      );
+
+      await client.query(
+        `INSERT INTO public.work_order_events (
+           tenant_id, work_order_id, user_id, event_type, reason, justification, meter_at_service
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.tenantId,
+          req.params.id,
+          req.user.id,
+          eventType,
+          reason?.trim() || null,
+          justification?.trim() || null,
+          meterAtService ?? null,
+        ],
+      );
+
+      return { status: transition.status };
+    });
+
+    if (outcome.notFound) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    if (outcome.invalidTransition) {
+      return res.status(409).json({
+        message: `Transição não permitida a partir do estado "${outcome.currentStatus}".`,
+      });
+    }
+    return res.status(200).json({
+      message: 'Transição registada com sucesso.',
+      status: outcome.status,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/:id/timeline', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id
+         FROM public.work_orders
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+        [req.params.id, req.user.tenantId],
+      );
+      if (orderResult.rowCount === 0) return null;
+
+      const eventsResult = await client.query(
+        `SELECT events.*,
+                users.full_name AS user_name
+         FROM public.work_order_events AS events
+         LEFT JOIN public.app_users AS users
+           ON users.id = events.user_id
+          AND users.tenant_id = events.tenant_id
+         WHERE events.work_order_id = $1
+           AND events.tenant_id = $2
+         ORDER BY events.created_at ASC, events.id ASC`,
+        [req.params.id, req.user.tenantId],
+      );
+      return eventsResult.rows;
+    });
+
+    if (result === null) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ events: result });
   } catch (error) {
     return next(error);
   }
