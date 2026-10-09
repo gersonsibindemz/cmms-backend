@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { withTenantContext } from '../db.js';
-import { authenticateToken } from '../middlewares/auth.js';
+import { authenticateToken, enforceDomainScope } from '../middlewares/auth.js';
 
 const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
-router.use(authenticateToken);
+router.use(authenticateToken, enforceDomainScope);
 
 function requireTenant(req, res, next) {
   if (!req.user.tenantId) {
@@ -16,6 +16,9 @@ function requireTenant(req, res, next) {
 
 router.get('/', requireTenant, async (req, res, next) => {
   try {
+    const values = [req.user.tenantId];
+    const scopeClause = req.userScope ? 'AND t.domain = $2' : '';
+    if (req.userScope) values.push(req.userScope);
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `SELECT t.*, COALESCE(u.email, t.email) AS user_email
@@ -26,8 +29,9 @@ router.get('/', requireTenant, async (req, res, next) => {
          WHERE t.tenant_id = $1
            AND t.deleted_at IS NULL
            AND t.status = 'active'
+           ${scopeClause}
          ORDER BY t.name ASC`,
-        [req.user.tenantId],
+        values,
       ),
     );
 
@@ -38,7 +42,8 @@ router.get('/', requireTenant, async (req, res, next) => {
 });
 
 router.post('/', requireTenant, async (req, res, next) => {
-  const { name, specialty, phone, email, hourlyRate, userId } = req.body ?? {};
+  const { name, specialty, phone, email, hourlyRate, userId, domain } = req.body ?? {};
+  const technicianDomain = req.userScope ?? domain ?? 'fleet';
 
   if (
     typeof name !== 'string' ||
@@ -57,7 +62,8 @@ router.post('/', requireTenant, async (req, res, next) => {
     )) ||
     (userId !== undefined && userId !== null && (
       typeof userId !== 'string' || !UUID_PATTERN.test(userId)
-    ))
+    )) ||
+    !['fleet', 'plant'].includes(technicianDomain)
   ) {
     return res.status(400).json({ message: 'Dados do técnico inválidos.' });
   }
@@ -79,9 +85,9 @@ router.post('/', requireTenant, async (req, res, next) => {
 
       const result = await client.query(
         `INSERT INTO public.technicians (
-           tenant_id, name, specialty, phone, email, hourly_rate, user_id
+           tenant_id, name, specialty, phone, email, hourly_rate, user_id, domain
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING *`,
         [
           req.user.tenantId,
@@ -91,6 +97,7 @@ router.post('/', requireTenant, async (req, res, next) => {
           email?.trim().toLowerCase() || null,
           hourlyRate ?? null,
           userId ?? null,
+          technicianDomain,
         ],
       );
       return { technician: result.rows[0] };

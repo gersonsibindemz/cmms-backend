@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import { withTenantContext } from '../db.js';
-import { authenticateToken, requireRoles } from '../middlewares/auth.js';
+import {
+  authenticateToken,
+  enforceDomainScope,
+  requireRoles,
+} from '../middlewares/auth.js';
 
 const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
@@ -8,7 +12,7 @@ const ORDER_TYPES = new Set(['corrective', 'preventive', 'inspection']);
 const PRIORITIES = new Set(['low', 'medium', 'high', 'urgent']);
 const STATUSES = new Set(['open', 'in_progress', 'waiting_parts', 'blocked', 'completed', 'cancelled']);
 
-router.use(authenticateToken);
+router.use(authenticateToken, enforceDomainScope);
 
 function requireTenant(req, res, next) {
   if (!req.user.tenantId) {
@@ -21,6 +25,10 @@ router.get('/', requireTenant, async (req, res, next) => {
   const { id: userId, role, tenantId } = req.user;
   const filters = [];
   const values = [tenantId];
+  if (req.userScope) {
+    values.push(req.userScope);
+    filters.push(`work_orders.domain = $${values.length}`);
+  }
 
   for (const [queryKey, column] of [
     ['status', 'work_orders.status'],
@@ -52,8 +60,9 @@ router.get('/', requireTenant, async (req, res, next) => {
            WHERE user_id = $1
              AND tenant_id = $2
              AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
            LIMIT 1`,
-          [userId, tenantId],
+          req.userScope ? [userId, tenantId, req.userScope] : [userId, tenantId],
         );
         const technicianId = technicianResult.rows[0]?.id;
         if (!technicianId) return { rows: [] };
@@ -80,6 +89,7 @@ router.get('/', requireTenant, async (req, res, next) => {
            ON assets.id = work_orders.asset_id
           AND assets.tenant_id = work_orders.tenant_id
           AND assets.deleted_at IS NULL
+          ${req.userScope ? 'AND assets.domain = $2' : ''}
          LEFT JOIN public.app_users AS assigned_user
            ON assigned_user.id = work_orders.assigned_to
           AND assigned_user.tenant_id = work_orders.tenant_id
@@ -90,6 +100,7 @@ router.get('/', requireTenant, async (req, res, next) => {
            )
           AND assigned_technician.tenant_id = work_orders.tenant_id
           AND assigned_technician.deleted_at IS NULL
+          ${req.userScope ? 'AND assigned_technician.domain = $2' : ''}
          WHERE work_orders.tenant_id = $1
            AND work_orders.deleted_at IS NULL
            ${whereFilters}
@@ -121,13 +132,17 @@ router.get('/:id', requireTenant, async (req, res, next) => {
          JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
           AND assets.tenant_id = work_orders.tenant_id
+          ${req.userScope ? 'AND assets.domain = $3' : ''}
          LEFT JOIN public.app_users AS assigned_user
            ON assigned_user.id = work_orders.assigned_to
           AND assigned_user.tenant_id = work_orders.tenant_id
          WHERE work_orders.id = $1
            AND work_orders.tenant_id = $2
-           AND work_orders.deleted_at IS NULL`,
-        [req.params.id, req.user.tenantId],
+           AND work_orders.deleted_at IS NULL
+           ${req.userScope ? 'AND work_orders.domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       ),
     );
 
@@ -187,8 +202,11 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
          WHERE id = $1
            AND tenant_id = $2
            AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          FOR UPDATE`,
-        [req.params.id, req.user.tenantId],
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       );
       const order = orderResult.rows[0];
       if (!order) return { notFound: true };
@@ -230,13 +248,15 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
              updated_at = NOW()
          WHERE id::text = $2::text
            AND tenant_id::text = $3::text
-           AND deleted_at IS NULL`,
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $6' : ''}`,
         [
           transition.status,
           req.params.id,
           req.user.tenantId,
           eventType,
           meterAtService ?? null,
+          ...(req.userScope ? [req.userScope] : []),
         ],
       );
 
@@ -289,8 +309,11 @@ router.get('/:id/timeline', requireTenant, async (req, res, next) => {
       const orderResult = await client.query(
         `SELECT id
          FROM public.work_orders
-         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
-        [req.params.id, req.user.tenantId],
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       );
       if (orderResult.rowCount === 0) return null;
 
@@ -298,13 +321,20 @@ router.get('/:id/timeline', requireTenant, async (req, res, next) => {
         `SELECT events.*,
                 users.full_name AS user_name
          FROM public.work_order_events AS events
+         JOIN public.work_orders AS scoped_order
+           ON scoped_order.id = events.work_order_id
+          AND scoped_order.tenant_id = events.tenant_id
+          AND scoped_order.deleted_at IS NULL
          LEFT JOIN public.app_users AS users
            ON users.id = events.user_id
           AND users.tenant_id = events.tenant_id
          WHERE events.work_order_id = $1
            AND events.tenant_id = $2
+           ${req.userScope ? 'AND scoped_order.domain = $3' : ''}
          ORDER BY events.created_at ASC, events.id ASC`,
-        [req.params.id, req.user.tenantId],
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       );
       return eventsResult.rows;
     });
@@ -355,13 +385,16 @@ router.post('/', requireTenant, async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const assetResult = await client.query(
-        `SELECT id
+        `SELECT id, domain
          FROM public.assets
          WHERE id = $1
            AND tenant_id = $2
            AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          FOR UPDATE`,
-        [assetId, req.user.tenantId],
+        req.userScope
+          ? [assetId, req.user.tenantId, req.userScope]
+          : [assetId, req.user.tenantId],
       );
       if (assetResult.rowCount === 0) return { notFound: true };
 
@@ -385,11 +418,11 @@ router.post('/', requireTenant, async (req, res, next) => {
       const result = await client.query(
         `INSERT INTO public.work_orders (
            tenant_id, os_number, asset_id, title, description, order_type,
-           priority, status, assigned_to, opened_by, meter_at_service
+           priority, status, assigned_to, opened_by, meter_at_service, domain
          )
          VALUES (
            $1, COALESCE($2, public.generate_work_order_number()), $3, $4, $5,
-           $6, $7, 'open', $8, $9, $10
+           $6, $7, 'open', $8, $9, $10, $11
          )
          RETURNING *`,
         [
@@ -403,6 +436,7 @@ router.post('/', requireTenant, async (req, res, next) => {
           assignedTo ?? null,
           req.user.id ?? null,
           meterAtService ?? null,
+          assetResult.rows[0].domain,
         ],
       );
 
@@ -486,6 +520,8 @@ router.put('/:id', requireTenant, async (req, res, next) => {
   }
 
   fields.push('updated_at = NOW()');
+  if (req.userScope) values.push(req.userScope);
+  const scopeClause = req.userScope ? `AND domain = $${values.length}` : '';
 
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
@@ -503,6 +539,7 @@ router.put('/:id', requireTenant, async (req, res, next) => {
          WHERE id = $1
            AND tenant_id = $2
            AND deleted_at IS NULL
+           ${scopeClause}
          RETURNING *`,
         values,
       );
@@ -534,8 +571,11 @@ router.delete('/:id', requireTenant, async (req, res, next) => {
          WHERE id = $1
            AND tenant_id = $2
            AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          RETURNING *`,
-        [req.params.id, req.user.tenantId],
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       ),
     );
 
@@ -562,11 +602,14 @@ router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervis
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const orderResult = await client.query(
-        `SELECT id, asset_id
+        `SELECT id, asset_id, domain
          FROM public.work_orders
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          FOR UPDATE`,
-        [req.params.id, req.user.tenantId],
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       );
       const order = orderResult.rows[0];
       if (!order) return null;
@@ -574,8 +617,11 @@ router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervis
       const assetResult = await client.query(
         `SELECT id FROM public.assets
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          FOR UPDATE`,
-        [order.asset_id, req.user.tenantId],
+        req.userScope
+          ? [order.asset_id, req.user.tenantId, req.userScope]
+          : [order.asset_id, req.user.tenantId],
       );
       if (assetResult.rowCount === 0) return null;
 
@@ -588,15 +634,21 @@ router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervis
              parts_cost_mzn = $2,
              labor_cost_mzn = $3
          WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $6' : ''}
          RETURNING *`,
-        [downtimeHours, partsCostMzn, laborCostMzn, req.params.id, req.user.tenantId],
+        req.userScope
+          ? [downtimeHours, partsCostMzn, laborCostMzn, req.params.id, req.user.tenantId, req.userScope]
+          : [downtimeHours, partsCostMzn, laborCostMzn, req.params.id, req.user.tenantId],
       );
 
       await client.query(
         `UPDATE public.assets
          SET status = 'operational'
-         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
-        [order.asset_id, req.user.tenantId],
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [order.asset_id, req.user.tenantId, req.userScope]
+          : [order.asset_id, req.user.tenantId],
       );
 
       return updatedOrder.rows[0];

@@ -1,4 +1,15 @@
 import jwt from 'jsonwebtoken';
+import { withTenantContext } from '../db.js';
+
+const DOMAIN_SCOPES = new Set(['fleet', 'plant']);
+const SCOPED_ROLES = new Set(['supervisor', 'technician', 'driver_operator']);
+const USER_ROLES = new Set([
+  'super_admin',
+  'tenant_admin',
+  'supervisor',
+  'technician',
+  'driver_operator',
+]);
 
 export function authenticateToken(req, res, next) {
   const token = req.cookies?.auth_token;
@@ -9,12 +20,16 @@ export function authenticateToken(req, res, next) {
 
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (!USER_ROLES.has(payload.role)) {
+      return res.status(403).json({ message: 'Token inválido ou expirado.' });
+    }
 
     req.user = {
       id: payload.id ?? payload.userId,
       tenantId: payload.tenantId,
       role: payload.role,
       fullName: payload.fullName,
+      operational_scope: payload.operational_scope,
     };
 
     return next();
@@ -23,12 +38,124 @@ export function authenticateToken(req, res, next) {
   }
 }
 
-export function requireRoles(...allowedRoles) {
+export function requireRole(allowedRoles) {
   return (req, res, next) => {
-    if (!req.user || !allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({ message: 'Acesso não permitido.' });
+    if (!req.user || !Array.isArray(allowedRoles) || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
     }
 
     return next();
+  };
+}
+
+export function requireRoles(...allowedRoles) {
+  return requireRole(allowedRoles);
+}
+
+export function enforceDomainScope(req, res, next) {
+  if (!USER_ROLES.has(req.user.role)) {
+    return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
+  }
+  if (req.user.role === 'super_admin') return next();
+
+  if (SCOPED_ROLES.has(req.user.role)) {
+    const scope = req.user.operational_scope;
+    if (!DOMAIN_SCOPES.has(scope)) {
+      return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
+    }
+    req.userScope = scope;
+    return next();
+  }
+
+  if (req.user.role !== 'tenant_admin') return next();
+  if (!req.user.tenantId) {
+    return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+  }
+
+  const requestedScope = req.query.domain
+    ?? req.query.operational_scope
+    ?? req.get('x-operational-scope')
+    ?? req.get('x-domain');
+  if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
+    return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+
+  withTenantContext(req.user.tenantId, req.user.role, (client) =>
+    client.query(
+      `SELECT operational_scope, default_operational_scope
+       FROM public.tenants
+       WHERE id = $1::uuid`,
+      [req.user.tenantId],
+    ),
+  ).then((result) => {
+    const tenantScope = result.rows[0]?.operational_scope;
+    if (!tenantScope) {
+      return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
+    }
+
+    if (tenantScope === 'mixed') {
+      req.userScope = requestedScope ?? result.rows[0].default_operational_scope;
+    } else {
+      if (requestedScope !== undefined && requestedScope !== tenantScope) {
+        return res.status(403).json({ error: 'O escopo solicitado não está disponível neste tenant.' });
+      }
+      req.userScope = tenantScope;
+    }
+    return next();
+  }).catch(next);
+}
+
+export function checkTenantLimits(limitType) {
+  if (!['assets', 'users'].includes(limitType)) {
+    throw new TypeError(`Tipo de limite desconhecido: ${limitType}`);
+  }
+
+  return async (req, res, next) => {
+    if (!req.user?.tenantId) {
+      return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+    }
+
+    try {
+      const allowed = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const tenantResult = await client.query(
+          `SELECT max_assets_limit, max_users_limit
+           FROM public.tenants
+           WHERE id = $1::uuid`,
+          [req.user.tenantId],
+        );
+        const tenant = tenantResult.rows[0];
+        if (!tenant) return false;
+
+        const countResult = limitType === 'assets'
+          ? await client.query(
+            `SELECT COUNT(*)::int AS total
+             FROM public.assets
+             WHERE tenant_id = $1::uuid
+               AND deleted_at IS NULL
+               AND status <> 'decommissioned'`,
+            [req.user.tenantId],
+          )
+          : await client.query(
+            `SELECT COUNT(*)::int AS total
+             FROM public.app_users
+             WHERE tenant_id = $1::uuid
+               AND is_active IS TRUE`,
+            [req.user.tenantId],
+          );
+        const limit = Number(limitType === 'assets'
+          ? tenant.max_assets_limit
+          : tenant.max_users_limit);
+
+        return countResult.rows[0].total < limit;
+      });
+
+      if (!allowed) {
+        const resource = limitType === 'assets' ? 'ativos' : 'utilizadores';
+        return res.status(403).json({ error: `Limite de ${resource} atingido para este tenant.` });
+      }
+      return next();
+    } catch (error) {
+      return next(error);
+    }
   };
 }

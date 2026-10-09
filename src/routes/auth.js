@@ -23,6 +23,7 @@ router.post('/login', async (req, res) => {
     // 1. Busca usuário e dados da empresa
     const userQuery = await pool.query(
       `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.role, u.is_active,
+              u.operational_scope,
               t.is_active as tenant_active, t.name as tenant_name
        FROM app_users u
        LEFT JOIN tenants t ON t.id = u.tenant_id
@@ -57,7 +58,8 @@ router.post('/login', async (req, res) => {
         userId: user.id,
         tenantId: user.tenant_id,
         role: user.role,
-        fullName: user.full_name
+        fullName: user.full_name,
+        operational_scope: user.operational_scope,
       },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
@@ -78,7 +80,8 @@ router.post('/login', async (req, res) => {
         fullName: user.full_name,
         role: user.role,
         tenantId: user.tenant_id,
-        tenantName: user.tenant_name
+        tenantName: user.tenant_name,
+        operational_scope: user.operational_scope,
       }
     });
   } catch (error) {

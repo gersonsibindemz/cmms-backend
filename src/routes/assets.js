@@ -2,8 +2,12 @@
 import express from 'express';
 import multer from 'multer';
 import { basename } from 'node:path';
-import { pool, withTenantContext } from '../db.js';
-import { authenticateToken } from '../middlewares/auth.js';
+import { withTenantContext } from '../db.js';
+import {
+  authenticateToken,
+  checkTenantLimits,
+  enforceDomainScope,
+} from '../middlewares/auth.js';
 import {
   getSignedFileUrl,
   removeAssetFile,
@@ -57,7 +61,7 @@ const documentUpload = multer({
   },
 });
 
-router.use(authenticateToken);
+router.use(authenticateToken, enforceDomainScope);
 
 function handleDocumentUpload(req, res, next) {
   documentUpload.single('file')(req, res, (error) => {
@@ -140,6 +144,19 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
     );
     uploaded = true;
 
+    const scopeClause = req.userScope ? 'AND assets.domain = $10' : '';
+    const values = [
+      req.user.tenantId,
+      req.params.id,
+      documentType,
+      title,
+      storagePath,
+      fileName,
+      req.file.mimetype,
+      req.file.size,
+      req.user.id,
+    ];
+    if (req.userScope) values.push(req.userScope);
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `INSERT INTO public.asset_documents (
@@ -151,19 +168,10 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
          WHERE assets.id = $2
            AND assets.tenant_id = $1
            AND assets.deleted_at IS NULL
+           ${scopeClause}
          RETURNING id, tenant_id, asset_id, document_type, title, file_name,
                    file_url, mime_type, file_size_bytes, uploaded_by, created_at`,
-        [
-          req.user.tenantId,
-          req.params.id,
-          documentType,
-          title,
-          storagePath,
-          fileName,
-          req.file.mimetype,
-          req.file.size,
-          req.user.id,
-        ],
+        values,
       ),
     );
 
@@ -191,13 +199,17 @@ router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUplo
 router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) => {
   try {
     const documents = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const values = [req.params.id, req.user.tenantId];
+      const scopeClause = req.userScope ? 'AND domain = $3' : '';
+      if (req.userScope) values.push(req.userScope);
       const assetResult = await client.query(
         `SELECT id
          FROM public.assets
          WHERE id = $1
            AND tenant_id = $2
-           AND deleted_at IS NULL`,
-        [req.params.id, req.user.tenantId],
+           AND deleted_at IS NULL
+           ${scopeClause}`,
+        values,
       );
 
       if (assetResult.rows.length === 0) return null;
@@ -235,11 +247,16 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
 });
 
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
-router.get('/', async (req, res) => {
+router.get('/', requireTenant, async (req, res) => {
   try {
-    const query = `
+    const values = [req.user.tenantId];
+    const scopeClause = req.userScope ? 'AND domain = $2' : '';
+    if (req.userScope) values.push(req.userScope);
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `
       SELECT 
-        id, code_tag, name, category, criticality_level, brand, model, manufacture_year,
+        id, code_tag, name, category, criticality_level, brand, model, manufacture_year, domain,
         current_meter, meter_kind, status, cost_center,
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
         insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
@@ -249,10 +266,13 @@ router.get('/', async (req, res) => {
       FROM public.assets
       WHERE deleted_at IS NULL
         AND tenant_id = $1
+        ${scopeClause}
       ORDER BY created_at DESC;
-    `;
-    const { rows } = await pool.query(query, [req.user.tenantId]);
-    res.json({ assets: rows });
+    `,
+        values,
+      ),
+    );
+    res.json({ assets: result.rows });
   } catch (error) {
     console.error('Erro ao listar ativos:', error);
     res.status(500).json({ error: 'Erro interno ao listar ativos' });
@@ -268,8 +288,9 @@ router.get('/:id', requireTenant, async (req, res) => {
         `SELECT * FROM public.assets
          WHERE (id::text = $1 OR code_tag = $1)
            AND tenant_id = $2
-           AND deleted_at IS NULL;`,
-        [id, req.user.tenantId],
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''};`,
+        req.userScope ? [id, req.user.tenantId, req.userScope] : [id, req.user.tenantId],
       ),
     );
 
@@ -298,8 +319,11 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
          WHERE (id::text = $1 OR code_tag = $1)
            AND tenant_id = $2
            AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
          FOR UPDATE;`,
-        [req.params.id, req.user.tenantId],
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
       );
 
       if (currentAsset.rows.length === 0) return null;
@@ -316,8 +340,11 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
          WHERE id = $2
            AND tenant_id = $3
            AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $4' : ''}
          RETURNING *;`,
-        [meterValue, currentAsset.rows[0].id, req.user.tenantId],
+        req.userScope
+          ? [meterValue, currentAsset.rows[0].id, req.user.tenantId, req.userScope]
+          : [meterValue, currentAsset.rows[0].id, req.user.tenantId],
       );
       return { asset: result.rows[0] };
     });
@@ -337,10 +364,11 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
 });
 
 // 3. CRIAR NOVO ATIVO (Com geração automática de código se não fornecido)
-router.post('/', async (req, res) => {
+router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) => {
   try {
     const {
       codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
+      domain,
       currentMeter, meterKind, costCenter,
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
@@ -352,11 +380,18 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
     }
 
+    const assetDomain = req.userScope ?? domain ?? 'fleet';
+    if (!['fleet', 'plant'].includes(assetDomain)) {
+      return res.status(400).json({ error: 'Domínio do ativo inválido.' });
+    }
+
     let finalCodeTag = emptyToNull(codeTag);
     if (!finalCodeTag) {
-      const codeRes = await pool.query(
-        'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code;',
-        [req.user.tenantId, category]
+      const codeRes = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+        client.query(
+          'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code;',
+          [req.user.tenantId, category],
+        ),
       );
       finalCodeTag = codeRes.rows[0].generated_code;
     }
@@ -368,14 +403,14 @@ router.post('/', async (req, res) => {
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
         insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
-        pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs
+        pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs, domain
       ) VALUES (
         $1, $2, $3, $4, COALESCE($5, 'B'), $6, $7, $8,
         COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11,
         $12, $13, $14, $15,
         $16, $17, $18, $19,
         $20, $21, $22, $23,
-        $24, $25, $26, COALESCE($27, '{}'::jsonb)
+        $24, $25, $26, COALESCE($27, '{}'::jsonb), $28
       ) RETURNING *;
     `;
 
@@ -390,10 +425,13 @@ router.post('/', async (req, res) => {
       emptyToNull(plantSector), emptyToNull(voltageSpecs), emptyToNull(powerKwKva),
       emptyToNull(innoqCalibrationExpiry), emptyToNull(pressureTestExpiry),
       emptyToNull(localSupplierName), emptyToNull(warrantyExpiry),
-      emptyToNull(technicalSpecs) ? JSON.stringify(technicalSpecs) : '{}'
+      emptyToNull(technicalSpecs) ? JSON.stringify(technicalSpecs) : '{}',
+      assetDomain,
     ];
 
-    const { rows } = await pool.query(insertQuery, values);
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(insertQuery, values),
+    );
     res.status(201).json({ asset: rows[0] });
   } catch (error) {
     console.error('Erro ao criar ativo:', error);
@@ -405,7 +443,7 @@ router.post('/', async (req, res) => {
 });
 
 // 4. ATUALIZAR ATIVO (Edição com auditoria automática pelo trigger)
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireTenant, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -445,6 +483,7 @@ router.put('/:id', async (req, res) => {
         technical_specs = COALESCE($24, technical_specs),
         updated_at = NOW()
       WHERE id = $25 AND deleted_at IS NULL AND tenant_id = $26
+        ${req.userScope ? 'AND domain = $27' : ''}
       RETURNING *;
     `;
 
@@ -459,7 +498,10 @@ router.put('/:id', async (req, res) => {
       id, req.user.tenantId
     ];
 
-    const { rows } = await pool.query(updateQuery, values);
+    if (req.userScope) values.push(req.userScope);
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(updateQuery, values),
+    );
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Ativo não encontrado para atualização' });
     }
@@ -472,12 +514,19 @@ router.put('/:id', async (req, res) => {
 });
 
 // 5. SOFT-DELETE (Inativação com auditoria)
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireTenant, async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await pool.query(
-      'UPDATE public.assets SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2 RETURNING id, code_tag;',
-      [id, req.user.tenantId]
+    const values = [id, req.user.tenantId];
+    const scopeClause = req.userScope ? 'AND domain = $3' : '';
+    if (req.userScope) values.push(req.userScope);
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.assets SET deleted_at = NOW()
+         WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2 ${scopeClause}
+         RETURNING id, code_tag;`,
+        values,
+      ),
     );
 
     if (rows.length === 0) {
