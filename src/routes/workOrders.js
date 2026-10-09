@@ -18,8 +18,9 @@ function requireTenant(req, res, next) {
 }
 
 router.get('/', requireTenant, async (req, res, next) => {
+  const { id: userId, role, tenantId } = req.user;
   const filters = [];
-  const values = [req.user.tenantId];
+  const values = [tenantId];
 
   for (const [queryKey, column] of [
     ['status', 'work_orders.status'],
@@ -39,27 +40,63 @@ router.get('/', requireTenant, async (req, res, next) => {
     filters.push(`${column} = $${values.length}`);
   }
 
-  const whereFilters = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
-
   try {
-    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
-      client.query(
+    const result = await withTenantContext(tenantId, role, async (client) => {
+      const queryFilters = [...filters];
+      const queryValues = [...values];
+
+      if (role === 'technician') {
+        const technicianResult = await client.query(
+          `SELECT id
+           FROM public.technicians
+           WHERE user_id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+           LIMIT 1`,
+          [userId, tenantId],
+        );
+        const technicianId = technicianResult.rows[0]?.id;
+        if (!technicianId) return { rows: [] };
+
+        queryValues.push(userId, technicianId);
+        queryFilters.push(
+          `(work_orders.assigned_to = $${queryValues.length - 1}
+            OR work_orders.assigned_to = $${queryValues.length}
+            OR (work_orders.assigned_to IS NULL AND work_orders.status = 'open'))`,
+        );
+      }
+
+      const whereFilters = queryFilters.length > 0
+        ? `AND ${queryFilters.join(' AND ')}`
+        : '';
+
+      return client.query(
         `SELECT work_orders.*,
-                assets.code_tag AS asset_code_tag,
-                assets.name AS asset_name,
-                assets.category AS asset_category
+                to_jsonb(assets) AS asset,
+                to_jsonb(assigned_technician) AS technician,
+                assigned_user.full_name AS assigned_to_name
          FROM public.work_orders AS work_orders
          JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
           AND assets.tenant_id = work_orders.tenant_id
           AND assets.deleted_at IS NULL
+         LEFT JOIN public.app_users AS assigned_user
+           ON assigned_user.id = work_orders.assigned_to
+          AND assigned_user.tenant_id = work_orders.tenant_id
+         LEFT JOIN public.technicians AS assigned_technician
+           ON (
+             assigned_technician.user_id = work_orders.assigned_to
+             OR assigned_technician.id = work_orders.assigned_to
+           )
+          AND assigned_technician.tenant_id = work_orders.tenant_id
+          AND assigned_technician.deleted_at IS NULL
          WHERE work_orders.tenant_id = $1
            AND work_orders.deleted_at IS NULL
            ${whereFilters}
          ORDER BY work_orders.created_at DESC`,
-        values,
-      ),
-    );
+        queryValues,
+      );
+    });
 
     return res.json({ workOrders: result.rows });
   } catch (error) {
@@ -120,6 +157,9 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
   if (!transition) {
     return res.status(400).json({ message: 'Tipo de transição inválido.' });
   }
+  if (req.user.role === 'technician' && eventType === 'interrupt') {
+    return res.status(403).json({ message: 'Técnicos não podem interromper ordens de serviço.' });
+  }
   if (
     (eventType === 'pause' || eventType === 'interrupt') &&
     (typeof reason !== 'string' || !reason.trim() ||
@@ -142,7 +182,7 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const orderResult = await client.query(
-        `SELECT id, status
+        `SELECT id, status, assigned_to
          FROM public.work_orders
          WHERE id = $1
            AND tenant_id = $2
@@ -152,6 +192,24 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
       );
       const order = orderResult.rows[0];
       if (!order) return { notFound: true };
+      if (req.user.role === 'technician') {
+        const technicianResult = await client.query(
+          `SELECT id
+           FROM public.technicians
+           WHERE user_id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+           LIMIT 1`,
+          [req.user.id, req.user.tenantId],
+        );
+        const technicianId = technicianResult.rows[0]?.id;
+        if (
+          !technicianId ||
+          (order.assigned_to !== req.user.id && order.assigned_to !== technicianId)
+        ) {
+          return { forbidden: true };
+        }
+      }
       if (!transition.allowedFrom.includes(order.status)) {
         return { invalidTransition: true, currentStatus: order.status };
       }
@@ -202,6 +260,9 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
 
     if (outcome.notFound) {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    if (outcome.forbidden) {
+      return res.status(403).json({ message: 'Só pode executar transições em ordens atribuídas a si.' });
     }
     if (outcome.invalidTransition) {
       return res.status(409).json({
