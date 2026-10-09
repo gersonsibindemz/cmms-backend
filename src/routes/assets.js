@@ -260,22 +260,79 @@ router.get('/', async (req, res) => {
 });
 
 // 2. OBTER ATIVO ESPECÍFICO PELO ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', requireTenant, async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await pool.query(
-      'SELECT * FROM public.assets WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2;',
-      [id, req.user.tenantId]
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT * FROM public.assets
+         WHERE (id::text = $1 OR code_tag = $1)
+           AND tenant_id = $2
+           AND deleted_at IS NULL;`,
+        [id, req.user.tenantId],
+      ),
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({ error: 'Ativo não encontrado' });
+      return res.status(404).json({ error: 'Ativo não encontrado ou sem permissão de acesso.' });
     }
 
-    res.json({ asset: rows[0] });
+    return res.json({ asset: rows[0] });
   } catch (error) {
     console.error('Erro ao obter ativo:', error);
-    res.status(500).json({ error: 'Erro interno ao consultar ativo' });
+    return res.status(500).json({ error: 'Erro interno ao consultar ativo' });
+  }
+});
+
+router.patch('/:id/meter', requireTenant, async (req, res) => {
+  const { meterValue } = req.body ?? {};
+  if (typeof meterValue !== 'number' || !Number.isFinite(meterValue) || meterValue < 0) {
+    return res.status(400).json({ error: 'Valor do contador inválido.' });
+  }
+
+  try {
+    const asset = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const currentAsset = await client.query(
+        `SELECT id, current_meter
+         FROM public.assets
+         WHERE (id::text = $1 OR code_tag = $1)
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+         FOR UPDATE;`,
+        [req.params.id, req.user.tenantId],
+      );
+
+      if (currentAsset.rows.length === 0) return null;
+      if (
+        currentAsset.rows[0].current_meter !== null
+        && meterValue < Number(currentAsset.rows[0].current_meter)
+      ) {
+        return { meterCannotDecrease: true };
+      }
+
+      const result = await client.query(
+        `UPDATE public.assets
+         SET current_meter = $1, updated_at = NOW()
+         WHERE id = $2
+           AND tenant_id = $3
+           AND deleted_at IS NULL
+         RETURNING *;`,
+        [meterValue, currentAsset.rows[0].id, req.user.tenantId],
+      );
+      return { asset: result.rows[0] };
+    });
+
+    if (asset === null) {
+      return res.status(404).json({ error: 'Ativo não encontrado ou sem permissão de acesso.' });
+    }
+    if ('meterCannotDecrease' in asset) {
+      return res.status(400).json({ error: 'O novo valor do contador não pode ser inferior à leitura atual.' });
+    }
+
+    return res.status(200).json({ asset: asset.asset, message: 'Contador atualizado com sucesso.' });
+  } catch (error) {
+    console.error('Erro ao atualizar contador do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao atualizar contador do ativo.' });
   }
 });
 
