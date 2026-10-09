@@ -68,53 +68,80 @@ router.post(
   requireRoles('tenant_admin', 'supervisor'),
   async (req, res, next) => {
     const {
-      partNumber,
       name,
+      partNumber,
+      part_number,
+      oem_reference,
       category,
-      unitOfMeasure,
       location,
+      warehouse_location,
+      unitOfMeasure,
+      unit_of_measure,
+      currentStock,
+      current_stock,
       minStock,
-      initialStock,
+      min_stock,
       unitCost,
+      unit_cost,
     } = req.body ?? {};
+    const finalName = name?.trim();
+    const finalPartNumber = (partNumber || part_number || oem_reference || '').trim();
+    const finalCategory = category || 'Geral';
+    const finalLocation = location || warehouse_location || null;
+    const finalUnit = unitOfMeasure || unit_of_measure || 'un';
+    const finalStock = Number(currentStock ?? current_stock ?? 0);
+    const finalMinStock = Number(minStock ?? min_stock ?? 0);
+    const finalCost = Number(unitCost ?? unit_cost ?? 0);
 
-    if (
-      typeof partNumber !== 'string' || !partNumber.trim() ||
-      typeof name !== 'string' || !name.trim() ||
-      typeof category !== 'string' || !category.trim() ||
-      typeof unitOfMeasure !== 'string' || !unitOfMeasure.trim() ||
-      (location !== undefined && location !== null && typeof location !== 'string') ||
-      [minStock, initialStock, unitCost].some(
-        (value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0,
-      )
-    ) {
-      return res.status(400).json({ message: 'Dados da peça inválidos.' });
+    if (!finalName || !finalPartNumber) {
+      return res.status(400).json({
+        error: 'Nome da peça e Referência/OEM são obrigatórios.',
+      });
     }
 
     try {
-      const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
-        client.query(
+      const part = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const result = await client.query(
           `INSERT INTO public.parts (
              tenant_id, domain, part_number, name, category, unit_of_measure,
-             location, min_stock, current_stock, unit_cost
+             location, current_stock, min_stock, unit_cost
            )
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            RETURNING *`,
           [
             req.user.tenantId,
-            req.userScope ?? null,
-            partNumber.trim(),
-            name.trim(),
-            category.trim(),
-            unitOfMeasure.trim(),
-            location?.trim() || null,
-            minStock,
-            initialStock,
-            unitCost,
+            req.userScope || 'fleet',
+            finalPartNumber,
+            finalName,
+            finalCategory,
+            finalUnit,
+            finalLocation,
+            finalStock,
+            finalMinStock,
+            finalCost,
           ],
-        ),
-      );
-      return res.status(201).json({ part: result.rows[0] });
+        );
+        const createdPart = result.rows[0];
+
+        if (finalStock > 0) {
+          await client.query(
+            `INSERT INTO public.stock_movements (
+               tenant_id, part_id, user_id, movement_type, quantity, unit_cost, reason
+             )
+             VALUES ($1, $2, $3, 'in', $4, $5, 'initial_inventory')`,
+            [
+              req.user.tenantId,
+              createdPart.id,
+              req.user.id,
+              finalStock,
+              finalCost,
+            ],
+          );
+        }
+
+        return createdPart;
+      });
+      return res.status(201).json({ part });
     } catch (error) {
       return next(error);
     }
