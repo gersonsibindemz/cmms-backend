@@ -28,6 +28,20 @@ const DOCUMENT_TYPES = new Set([
   'insurance',
   'asset_photo',
 ]);
+const DOCUMENT_TYPE_LABELS = new Map([
+  ['ficha_tecnica', 'tech_sheet'],
+  ['ficha_tecnica_do_ativo', 'tech_sheet'],
+  ['manual', 'manual'],
+  ['diagrama', 'diagram'],
+  ['certificado_de_inspecao', 'inspection_certificate'],
+  ['certificado_de_vistoria', 'inspection_certificate'],
+  ['seguro', 'insurance'],
+  ['apolice', 'insurance'],
+  ['foto', 'asset_photo'],
+  ['fotografia', 'asset_photo'],
+  ['foto_do_ativo', 'asset_photo'],
+  ['fotografia_do_ativo', 'asset_photo'],
+]);
 
 const documentUpload = multer({
   storage: multer.memoryStorage(),
@@ -70,6 +84,20 @@ function getSafeDocumentName(originalName) {
   return name && name !== '.' && name !== '..' ? name : 'document';
 }
 
+function normalizeDocumentType(value) {
+  if (typeof value !== 'string') return null;
+
+  const normalized = value
+    .trim()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  const documentType = DOCUMENT_TYPE_LABELS.get(normalized) ?? normalized;
+
+  return DOCUMENT_TYPES.has(documentType) ? documentType : null;
+}
+
 function requireTenant(req, res, next) {
   if (!req.user.tenantId) {
     return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
@@ -86,14 +114,15 @@ function validateAssetId(req, res, next) {
 
 router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUpload, async (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: 'O ficheiro é obrigatório.' });
+    return res.status(400).json({ error: 'Nenhum ficheiro foi enviado. Anexe um ficheiro no campo "file".' });
   }
   if (req.file.size === 0) {
     return res.status(400).json({ error: 'O ficheiro não pode estar vazio.' });
   }
-  const documentType = typeof req.body.documentType === 'string' ? req.body.documentType.trim() : '';
+  const documentType = normalizeDocumentType(req.body.documentType)
+    ?? normalizeDocumentType(req.body.document_type);
   const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
-  if (!DOCUMENT_TYPES.has(documentType) || !title || title.length > 255) {
+  if (!documentType || !title || title.length > 255) {
     return res.status(400).json({ error: 'Tipo de documento ou título inválido.' });
   }
 
