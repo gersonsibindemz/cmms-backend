@@ -216,19 +216,20 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
 
       await client.query(
         `UPDATE public.work_orders
-         SET status = $1,
+         SET status = $1::text::varchar,
              started_at = CASE
-               WHEN $1 = 'in_progress' AND $4 = 'start' THEN COALESCE(started_at, NOW())
+               WHEN $1::text = 'in_progress'::text AND $4::text = 'start'::text
+                 THEN COALESCE(started_at, NOW())
                ELSE started_at
              END,
              completed_at = CASE
-               WHEN $1 = 'completed' THEN NOW()
+               WHEN $1::text = 'completed'::text THEN NOW()
                ELSE completed_at
              END,
              meter_at_service = COALESCE($5, meter_at_service),
              updated_at = NOW()
-         WHERE id = $2
-           AND tenant_id = $3
+         WHERE id::text = $2::text
+           AND tenant_id::text = $3::text
            AND deleted_at IS NULL`,
         [
           transition.status,
