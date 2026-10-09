@@ -588,6 +588,174 @@ router.delete('/:id', requireTenant, async (req, res, next) => {
   }
 });
 
+router.get('/:id/parts', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id
+         FROM public.work_orders
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      if (orderResult.rowCount === 0) return null;
+
+      return client.query(
+        `SELECT work_order_parts.id,
+                work_order_parts.work_order_id,
+                work_order_parts.part_id,
+                parts.name,
+                parts.part_number,
+                parts.unit_of_measure,
+                work_order_parts.quantity,
+                work_order_parts.unit_cost,
+                work_order_parts.quantity * work_order_parts.unit_cost AS total_cost,
+                work_order_parts.notes,
+                work_order_parts.applied_by,
+                work_order_parts.created_at
+         FROM public.work_order_parts AS work_order_parts
+         JOIN public.parts AS parts
+           ON parts.id = work_order_parts.part_id
+          AND parts.tenant_id = work_order_parts.tenant_id
+         WHERE work_order_parts.work_order_id = $1
+           AND work_order_parts.tenant_id = $2
+           ${req.userScope ? 'AND parts.domain = $3' : ''}
+         ORDER BY work_order_parts.created_at ASC`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+    });
+
+    if (!outcome) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ parts: outcome.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post(
+  '/:id/parts',
+  requireTenant,
+  requireRoles('technician', 'supervisor', 'tenant_admin'),
+  async (req, res, next) => {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+    }
+
+    const { partId, quantity, notes } = req.body ?? {};
+    if (
+      typeof partId !== 'string' || !UUID_PATTERN.test(partId) ||
+      typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 ||
+      (notes !== undefined && notes !== null && typeof notes !== 'string')
+    ) {
+      return res.status(400).json({ message: 'Dados da peça aplicada inválidos.' });
+    }
+
+    try {
+      const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const orderResult = await client.query(
+          `SELECT id, assigned_to, domain
+           FROM public.work_orders
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
+           FOR UPDATE`,
+          req.userScope
+            ? [req.params.id, req.user.tenantId, req.userScope]
+            : [req.params.id, req.user.tenantId],
+        );
+        const order = orderResult.rows[0];
+        if (!order) return { notFound: true };
+
+        if (req.user.role === 'technician') {
+          const technicianResult = await client.query(
+            `SELECT id
+             FROM public.technicians
+             WHERE user_id = $1
+               AND tenant_id = $2
+               AND deleted_at IS NULL
+               ${req.userScope ? 'AND domain = $3' : ''}
+             LIMIT 1`,
+            req.userScope
+              ? [req.user.id, req.user.tenantId, req.userScope]
+              : [req.user.id, req.user.tenantId],
+          );
+          const technicianId = technicianResult.rows[0]?.id;
+          if (
+            !technicianId ||
+            (order.assigned_to !== req.user.id && order.assigned_to !== technicianId)
+          ) {
+            return { forbidden: true };
+          }
+        }
+
+        const partResult = await client.query(
+          `SELECT id, name, part_number, unit_of_measure, unit_cost
+           FROM public.parts
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             AND domain = $3`,
+          [partId, req.user.tenantId, order.domain],
+        );
+        const part = partResult.rows[0];
+        if (!part) return { invalidPart: true };
+
+        const appliedResult = await client.query(
+          `INSERT INTO public.work_order_parts (
+             tenant_id, work_order_id, part_id, quantity, unit_cost, applied_by, notes
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *, quantity * unit_cost AS total_cost`,
+          [
+            req.user.tenantId,
+            order.id,
+            part.id,
+            quantity,
+            part.unit_cost,
+            req.user.id,
+            notes?.trim() || null,
+          ],
+        );
+        const applied = appliedResult.rows[0];
+        return {
+          part: {
+            ...applied,
+            name: part.name,
+            part_number: part.part_number,
+            unit_of_measure: part.unit_of_measure,
+          },
+        };
+      });
+
+      if (outcome.notFound) {
+        return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+      }
+      if (outcome.forbidden) {
+        return res.status(403).json({ message: 'A ordem de serviço não está atribuída a este técnico.' });
+      }
+      if (outcome.invalidPart) {
+        return res.status(404).json({ message: 'Peça não encontrada neste escopo operacional.' });
+      }
+      return res.status(201).json({ part: outcome.part });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
 router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervisor'), async (req, res, next) => {
   const { downtimeHours, partsCostMzn, laborCostMzn } = req.body ?? {};
 
