@@ -11,6 +11,7 @@ import {
 } from '../services/storage.js';
 
 const router = express.Router();
+const emptyToNull = (value) => (typeof value === 'string' && value.trim() === '' ? null : value);
 const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
 const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
   'application/pdf',
@@ -265,8 +266,8 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
     }
 
-    let finalCodeTag = codeTag;
-    if (!finalCodeTag || finalCodeTag.trim() === '') {
+    let finalCodeTag = emptyToNull(codeTag);
+    if (!finalCodeTag) {
       const codeRes = await pool.query(
         'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code;',
         [req.user.tenantId, category]
@@ -284,7 +285,7 @@ router.post('/', async (req, res) => {
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs
       ) VALUES (
         $1, $2, $3, $4, COALESCE($5, 'B'), $6, $7, $8,
-        COALESCE($9, 0), COALESCE($10, 'odometer_km'), $11,
+        COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11,
         $12, $13, $14, $15,
         $16, $17, $18, $19,
         $20, $21, $22, $23,
@@ -293,12 +294,17 @@ router.post('/', async (req, res) => {
     `;
 
     const values = [
-      req.user.tenantId, finalCodeTag, name, category, criticalityLevel, brand, model, manufactureYear || null,
-      currentMeter || 0, meterKind || 'odometer_km', costCenter || null,
-      licensePlate || null, chassisVin || null, engineNumber || null, inatroInspectionExpiry || null,
-      insurancePolicyNumber || null, insuranceCompany || null, insuranceExpiry || null, fuelTankCapacityLiters || null,
-      plantSector || null, voltageSpecs || null, powerKwKva || null, innoqCalibrationExpiry || null,
-      pressureTestExpiry || null, localSupplierName || null, warrantyExpiry || null, technicalSpecs ? JSON.stringify(technicalSpecs) : '{}'
+      req.user.tenantId, finalCodeTag, name, category, emptyToNull(criticalityLevel),
+      emptyToNull(brand), emptyToNull(model), emptyToNull(manufactureYear),
+      emptyToNull(currentMeter) ?? 0, emptyToNull(meterKind) ?? 'odometer_km',
+      emptyToNull(costCenter), emptyToNull(licensePlate), emptyToNull(chassisVin),
+      emptyToNull(engineNumber), emptyToNull(inatroInspectionExpiry),
+      emptyToNull(insurancePolicyNumber), emptyToNull(insuranceCompany),
+      emptyToNull(insuranceExpiry), emptyToNull(fuelTankCapacityLiters),
+      emptyToNull(plantSector), emptyToNull(voltageSpecs), emptyToNull(powerKwKva),
+      emptyToNull(innoqCalibrationExpiry), emptyToNull(pressureTestExpiry),
+      emptyToNull(localSupplierName), emptyToNull(warrantyExpiry),
+      emptyToNull(technicalSpecs) ? JSON.stringify(technicalSpecs) : '{}'
     ];
 
     const { rows } = await pool.query(insertQuery, values);
