@@ -1,7 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
-import { basename } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const BUCKET_NAME = 'asset-documents';
+const FILE_EXTENSIONS_BY_MIME_TYPE = new Map([
+  ['application/pdf', '.pdf'],
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp'],
+]);
 
 let supabaseClient;
 
@@ -23,14 +29,13 @@ function getSupabaseClient() {
   return supabaseClient;
 }
 
-function sanitizeFileName(fileName) {
-  return basename(fileName.replaceAll('\\', '/'))
-    .replace(/[^\p{L}\p{N}._-]/gu, '_')
-    .slice(0, 200) || 'document';
-}
+export async function uploadAssetFile(tenantId, assetId, fileBuffer, _fileName, mimeType) {
+  const fileExtension = FILE_EXTENSIONS_BY_MIME_TYPE.get(mimeType);
+  if (!fileExtension) {
+    throw new Error('Tipo MIME não permitido para o upload de documentos.');
+  }
 
-export async function uploadAssetFile(tenantId, assetId, fileBuffer, fileName, mimeType) {
-  const storagePath = `${tenantId}/${assetId}/${Date.now()}-${sanitizeFileName(fileName)}`;
+  const storagePath = `${tenantId}/${assetId}/${Date.now()}-${randomUUID()}${fileExtension}`;
   const { error } = await getSupabaseClient()
     .storage
     .from(BUCKET_NAME)
