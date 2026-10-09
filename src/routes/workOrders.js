@@ -21,6 +21,112 @@ function requireTenant(req, res, next) {
   return next();
 }
 
+function isValidPartsPayload(parts) {
+  return Array.isArray(parts) && parts.every((part) => (
+    part !== null &&
+    typeof part === 'object' &&
+    typeof part.partId === 'string' &&
+    UUID_PATTERN.test(part.partId) &&
+    typeof part.quantity === 'number' &&
+    Number.isFinite(part.quantity) &&
+    part.quantity > 0
+  ));
+}
+
+async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
+  const result = await client.query(
+    `SELECT work_order_parts.id,
+            work_order_parts.work_order_id,
+            work_order_parts.part_id,
+            parts.name,
+            parts.part_number,
+            parts.unit_of_measure,
+            work_order_parts.quantity,
+            work_order_parts.unit_cost,
+            work_order_parts.quantity * work_order_parts.unit_cost AS total_cost,
+            work_order_parts.notes,
+            work_order_parts.applied_by,
+            work_order_parts.created_at
+     FROM public.work_order_parts AS work_order_parts
+     JOIN public.parts AS parts
+       ON parts.id = work_order_parts.part_id
+      AND parts.tenant_id = work_order_parts.tenant_id
+     WHERE work_order_parts.work_order_id = $1
+       AND work_order_parts.tenant_id = $2
+       AND parts.domain = $3
+     ORDER BY work_order_parts.created_at ASC`,
+    [workOrderId, tenantId, domain],
+  );
+  return result.rows;
+}
+
+async function saveWorkOrderParts(client, {
+  tenantId,
+  workOrderId,
+  domain,
+  appliedBy,
+  parts,
+  replace = false,
+}) {
+  const preparedParts = [];
+  for (const item of parts) {
+    const result = await client.query(
+      `SELECT id, unit_cost
+       FROM public.parts
+       WHERE id = $1
+         AND tenant_id = $2
+         AND domain = $3
+         AND deleted_at IS NULL
+       FOR UPDATE`,
+      [item.partId, tenantId, domain],
+    );
+    const part = result.rows[0];
+    if (!part) {
+      const error = new Error('Uma peça não foi encontrada neste escopo operacional.');
+      error.code = 'INVALID_WORK_ORDER_PART';
+      throw error;
+    }
+    preparedParts.push({ ...item, unitCost: part.unit_cost });
+  }
+
+  if (replace) {
+    const existingParts = await client.query(
+      `SELECT part_id, SUM(quantity) AS quantity
+       FROM public.work_order_parts
+       WHERE work_order_id = $1
+         AND tenant_id = $2
+       GROUP BY part_id`,
+      [workOrderId, tenantId],
+    );
+    for (const existing of existingParts.rows) {
+      await client.query(
+        `UPDATE public.parts
+         SET current_stock = current_stock + $1,
+             updated_at = NOW()
+         WHERE id = $2 AND tenant_id = $3`,
+        [existing.quantity, existing.part_id, tenantId],
+      );
+    }
+    await client.query(
+      `DELETE FROM public.work_order_parts
+       WHERE work_order_id = $1 AND tenant_id = $2`,
+      [workOrderId, tenantId],
+    );
+  }
+
+  for (const item of preparedParts) {
+    await client.query(
+      `INSERT INTO public.work_order_parts (
+         tenant_id, work_order_id, part_id, quantity, unit_cost, applied_by
+       )
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [tenantId, workOrderId, item.partId, item.quantity, item.unitCost, appliedBy],
+    );
+  }
+
+  return { parts: await getWorkOrderParts(client, tenantId, workOrderId, domain) };
+}
+
 router.get('/', requireTenant, async (req, res, next) => {
   const { id: userId, role, tenantId } = req.user;
   const filters = [];
@@ -121,8 +227,8 @@ router.get('/:id', requireTenant, async (req, res, next) => {
   }
 
   try {
-    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
-      client.query(
+    const workOrder = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const result = await client.query(
         `SELECT work_orders.*,
                 assets.code_tag AS asset_code_tag,
                 assets.name AS asset_name,
@@ -143,13 +249,23 @@ router.get('/:id', requireTenant, async (req, res, next) => {
         req.userScope
           ? [req.params.id, req.user.tenantId, req.userScope]
           : [req.params.id, req.user.tenantId],
-      ),
-    );
+      );
 
-    if (result.rows.length === 0) {
+      const order = result.rows[0];
+      if (!order) return null;
+      order.parts = await getWorkOrderParts(
+        client,
+        req.user.tenantId,
+        order.id,
+        order.domain,
+      );
+      return order;
+    });
+
+    if (!workOrder) {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
     }
-    return res.json({ workOrder: result.rows[0] });
+    return res.json({ workOrder });
   } catch (error) {
     return next(error);
   }
@@ -358,6 +474,7 @@ router.post('/', requireTenant, async (req, res, next) => {
     assignedTo,
     meterAtService,
     osNumber,
+    parts,
   } = req.body ?? {};
 
   if (
@@ -377,7 +494,8 @@ router.post('/', requireTenant, async (req, res, next) => {
     )) ||
     (osNumber !== undefined && (
       typeof osNumber !== 'string' || !osNumber.trim() || osNumber.trim().length > 255
-    ))
+    )) ||
+    (parts !== undefined && !isValidPartsPayload(parts))
   ) {
     return res.status(400).json({ message: 'Dados obrigatórios da ordem de serviço inválidos.' });
   }
@@ -440,7 +558,20 @@ router.post('/', requireTenant, async (req, res, next) => {
         ],
       );
 
-      return { workOrder: result.rows[0] };
+      const workOrder = result.rows[0];
+      if (parts?.length) {
+        const savedParts = await saveWorkOrderParts(client, {
+          tenantId: req.user.tenantId,
+          workOrderId: workOrder.id,
+          domain: workOrder.domain,
+          appliedBy: req.user.id,
+          parts,
+        });
+        workOrder.parts = savedParts.parts;
+      } else {
+        workOrder.parts = [];
+      }
+      return { workOrder };
     });
 
     if (outcome.notFound) {
@@ -449,9 +580,11 @@ router.post('/', requireTenant, async (req, res, next) => {
     if (outcome.invalidAssignee) {
       return res.status(400).json({ message: 'Responsável não encontrado neste tenant.' });
     }
-
     return res.status(201).json({ workOrder: outcome.workOrder });
   } catch (error) {
+    if (error.code === 'INVALID_WORK_ORDER_PART') {
+      return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
     if (error.code === '23505') {
       return res.status(409).json({ message: 'Já existe uma ordem de serviço com este número.' });
     }
@@ -484,14 +617,42 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     }
     addField('priority', body.priority);
   }
-  if (body.assignedTo !== undefined) {
+  if (body.title !== undefined) {
     if (
-      body.assignedTo !== null
-      && (typeof body.assignedTo !== 'string' || !UUID_PATTERN.test(body.assignedTo))
+      typeof body.title !== 'string' ||
+      !body.title.trim() ||
+      body.title.trim().length > 255
+    ) {
+      return res.status(400).json({ message: 'Título da ordem de serviço inválido.' });
+    }
+    addField('title', body.title.trim());
+  }
+  if (body.description !== undefined) {
+    if (body.description !== null && typeof body.description !== 'string') {
+      return res.status(400).json({ message: 'Descrição da ordem de serviço inválida.' });
+    }
+    addField('description', body.description);
+  }
+  if (body.meterAtService !== undefined) {
+    if (
+      body.meterAtService !== null &&
+      (typeof body.meterAtService !== 'number' ||
+        !Number.isFinite(body.meterAtService) ||
+        body.meterAtService < 0)
+    ) {
+      return res.status(400).json({ message: 'Leitura do contador inválida.' });
+    }
+    addField('meter_at_service', body.meterAtService);
+  }
+  if (body.assignedTo !== undefined) {
+    const assignedTo = body.assignedTo || null;
+    if (
+      assignedTo !== null
+      && (typeof assignedTo !== 'string' || !UUID_PATTERN.test(assignedTo))
     ) {
       return res.status(400).json({ message: 'Técnico atribuído inválido.' });
     }
-    addField('assigned_to', body.assignedTo);
+    addField('assigned_to', assignedTo);
   }
   if (body.resolutionNotes !== undefined) {
     if (body.resolutionNotes !== null && typeof body.resolutionNotes !== 'string') {
@@ -515,11 +676,15 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     fields.push('completed_at = COALESCE(completed_at, NOW())');
   }
 
-  if (fields.length === 0) {
+  if (body.parts !== undefined && !isValidPartsPayload(body.parts)) {
+    return res.status(400).json({ message: 'Lista de peças inválida.' });
+  }
+  const shouldSyncParts = body.parts !== undefined;
+  if (fields.length === 0 && !shouldSyncParts) {
     return res.status(400).json({ message: 'Nenhum campo válido foi informado para atualização.' });
   }
 
-  fields.push('updated_at = NOW()');
+  if (fields.length > 0 || shouldSyncParts) fields.push('updated_at = NOW()');
   if (req.userScope) values.push(req.userScope);
   const scopeClause = req.userScope ? `AND domain = $${values.length}` : '';
 
@@ -543,7 +708,28 @@ router.put('/:id', requireTenant, async (req, res, next) => {
          RETURNING *`,
         values,
       );
-      return { workOrder: result.rows[0] ?? null };
+      const workOrder = result.rows[0];
+      if (!workOrder) return { workOrder: null };
+
+      if (shouldSyncParts) {
+        const savedParts = await saveWorkOrderParts(client, {
+          tenantId: req.user.tenantId,
+          workOrderId: workOrder.id,
+          domain: workOrder.domain,
+          appliedBy: req.user.id,
+          parts: body.parts,
+          replace: true,
+        });
+        workOrder.parts = savedParts.parts;
+      } else {
+        workOrder.parts = await getWorkOrderParts(
+          client,
+          req.user.tenantId,
+          workOrder.id,
+          workOrder.domain,
+        );
+      }
+      return { workOrder };
     });
 
     if (outcome.invalidAssignee) {
@@ -554,6 +740,9 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     }
     return res.json({ workOrder: outcome.workOrder });
   } catch (error) {
+    if (error.code === 'INVALID_WORK_ORDER_PART') {
+      return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
     return next(error);
   }
 });
