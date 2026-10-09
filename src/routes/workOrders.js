@@ -60,6 +60,21 @@ async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
   return result.rows;
 }
 
+async function assigneeExists(client, assignedTo, tenantId) {
+  const result = await client.query(
+    `SELECT id
+     FROM public.technicians
+     WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+     UNION
+     SELECT id
+     FROM public.app_users
+     WHERE id = $1 AND tenant_id = $2 AND is_active = true
+     LIMIT 1`,
+    [assignedTo, tenantId],
+  );
+  return result.rows.length > 0;
+}
+
 async function saveWorkOrderParts(client, {
   tenantId,
   workOrderId,
@@ -517,11 +532,9 @@ router.post('/', requireTenant, async (req, res, next) => {
       if (assetResult.rowCount === 0) return { notFound: true };
 
       if (assignedTo) {
-        const assigneeResult = await client.query(
-          'SELECT id FROM public.app_users WHERE id = $1 AND tenant_id = $2 AND is_active IS TRUE',
-          [assignedTo, req.user.tenantId],
-        );
-        if (assigneeResult.rowCount === 0) return { invalidAssignee: true };
+        if (!(await assigneeExists(client, assignedTo, req.user.tenantId))) {
+          return { invalidAssignee: true };
+        }
       }
 
       if (orderType === 'corrective') {
@@ -578,7 +591,7 @@ router.post('/', requireTenant, async (req, res, next) => {
       return res.status(404).json({ message: 'Ativo não encontrado neste tenant.' });
     }
     if (outcome.invalidAssignee) {
-      return res.status(400).json({ message: 'Responsável não encontrado neste tenant.' });
+      return res.status(400).json({ error: 'Responsável não encontrado neste tenant.' });
     }
     return res.status(201).json({ workOrder: outcome.workOrder });
   } catch (error) {
@@ -691,11 +704,9 @@ router.put('/:id', requireTenant, async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       if (body.assignedTo) {
-        const assigneeResult = await client.query(
-          'SELECT id FROM public.app_users WHERE id = $1 AND tenant_id = $2 AND is_active IS TRUE',
-          [body.assignedTo, req.user.tenantId],
-        );
-        if (assigneeResult.rowCount === 0) return { invalidAssignee: true };
+        if (!(await assigneeExists(client, body.assignedTo, req.user.tenantId))) {
+          return { invalidAssignee: true };
+        }
       }
 
       const result = await client.query(
@@ -733,7 +744,7 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     });
 
     if (outcome.invalidAssignee) {
-      return res.status(400).json({ message: 'Responsável não encontrado neste tenant.' });
+      return res.status(400).json({ error: 'Responsável não encontrado neste tenant.' });
     }
     if (!outcome.workOrder) {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
