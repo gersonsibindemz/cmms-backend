@@ -249,7 +249,6 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', requireTenant, async (req, res) => {
   try {
-    const values = [req.user.tenantId, req.userScope];
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `
@@ -262,12 +261,12 @@ router.get('/', requireTenant, async (req, res) => {
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs,
         created_at
       FROM public.assets
-      WHERE deleted_at IS NULL
-        AND tenant_id = $1
-        AND (domain = $2 OR to_jsonb(public.assets)->>'operational_scope' = $2)
+      WHERE tenant_id = $1::uuid
+        AND (domain = $2 OR operational_scope = $2)
+        AND deleted_at IS NULL
       ORDER BY created_at DESC;
     `,
-        values,
+        [req.user.tenantId, req.userScope],
       ),
     );
     res.json({ assets: result.rows });
