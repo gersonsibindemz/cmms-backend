@@ -1,0 +1,447 @@
+AUDITORIA TECNICA DO BACKEND CMMS
+Data da auditoria: 2026-10-13
+Escopo: codigo-fonte e migracoes SQL versionados neste repositorio.
+
+RESUMO EXECUTIVO
+----------------
+- API Express em src/server.js, com 10 routers montados sob /api e GET /health.
+- Autenticacao por JWT no cookie auth_token. A maioria das queries usa
+  withTenantContext(), que abre transacao e define contexto PostgreSQL.
+- O escopo operacional efetivamente persistido/consultado e fleet/plant,
+  guardado em app_users.operational_scope e filtrado principalmente por
+  assets/work_orders/parts/technicians.domain.
+- O codigo nao consulta tenants.business_types. A coluna nao aparece nas
+  migracoes versionadas. A validacao de disponibilidade usa
+  tenants.operational_scope (fleet, plant ou mixed).
+- Ha discrepancias funcionais relevantes: falta PATCH generico de OS, falta
+  POST /:id/close (o endpoint implementado e PATCH /:id/close), status
+  assigned aceito pela migracao mas rejeitado pelo PUT de OS, e o consumo de
+  pecas registado em work_order_parts nao reduz parts.current_stock.
+- A listagem de abastecimentos nao filtra explicitamente por tenant/domain
+  e o POST nao valida explicitamente o ativo contra o tenant/escopo do autor.
+- Nao foi encontrada definicao de triggers nas migracoes versionadas. A
+  atualizacao do inventario em restock/withdraw e feita manualmente no codigo.
+
+1. MAPA DE ROTAS E ENDPOINTS REGISTADOS
+---------------------------------------
+Middleware global HTTP em src/server.js:
+  cors(origin=FRONTEND_URL, credentials=true, metodos GET/POST/PUT/PATCH/
+  DELETE/OPTIONS), express.json(), cookieParser().
+  GET /health nao requer autenticacao.
+
+Em cada linha abaixo, o prefixo indicado e montado pelo server. Middleware
+indicado como "router" e herdado por todos os endpoints daquele ficheiro.
+withTenantContext nao e middleware Express: e chamado dentro dos handlers
+que executam SQL.
+
+src/routes/auth.js  [prefixo /api/auth]
+  POST /login       Sem authenticateToken; consulta utilizador, verifica
+                    bcrypt e emite cookie JWT HttpOnly.
+  POST /logout      Sem authenticateToken; limpa cookie.
+  GET  /me          Sem authenticateToken; verifica diretamente o JWT do
+                    cookie e retorna o payload.
+  SQL: login usa pool.query diretamente; /logout e /me nao consultam DB.
+
+src/routes/superAdmin.js  [prefixo /api/super-admin]
+  Router: authenticateToken, requireRoles('super_admin').
+  POST /tenants     Criacao de tenant e administrador.
+  GET  /tenants     Lista tenants e contagens.
+  SQL: POST abre/fecha explicitamente BEGIN/COMMIT, define set_config e
+       faz ROLLBACK em erro. GET usa withTenantContext(null, super_admin).
+
+src/routes/adminTenants.js  [prefixo /api/admin]
+  Router: authenticateToken, requireRole(['super_admin']).
+  GET   /tenants           Lista tenants, limites, escopos e contagens.
+  POST  /tenants           Cria tenant/admin; aceita operationalScope,
+                           defaultOperationalScope, limites e dados do admin.
+  PATCH /tenants/:id/status Altera is_active; recebe is_active, isActive
+                           ou status='active'/'suspended'.
+  SQL: withTenantContext(null, 'super_admin').
+
+src/routes/users.js  [prefixo /api/users]
+  Router: authenticateToken, requireRole(['tenant_admin']),
+          enforceDomainScope.
+  GET   /                  Lista app_users no tenant e operational_scope
+                           atual.
+  POST  /                  Cria utilizador; checkTenantLimits('users').
+  PUT   /:id               Atualiza nome, email, role, operational_scope e,
+                           opcionalmente, password.
+  PATCH /:id/toggle-status Alterna is_active.
+  SQL: withTenantContext. Criar/editar utilizador com role technician tambem
+       cria/atualiza o registo correspondente em technicians.
+
+src/routes/assets.js  [prefixo /api/assets]
+  Router: authenticateToken, enforceDomainScope.
+  POST   /:id/documents   requireTenant, validateAssetId,
+                          handleDocumentUpload (multer).
+  GET    /:id/documents   requireTenant, validateAssetId.
+  GET    /                requireTenant; lista ativos nao eliminados.
+  GET    /:id             requireTenant; consulta por UUID textual ou code_tag.
+  PATCH  /:id/meter       requireTenant; atualiza leitura do contador.
+  POST   /                requireTenant, checkTenantLimits('assets').
+  PUT    /:id             requireTenant; atualiza campos do ativo.
+  DELETE /:id             requireTenant; soft-delete por deleted_at.
+  SQL: withTenantContext. Upload tambem usa servico de storage.
+
+src/routes/fuelLogs.js  [prefixo /api/fuel]
+  Router: authenticateToken.
+  GET  /   Lista fuel_logs e junta assets.
+  POST /   Cria fuel_log.
+  SQL: withTenantContext; handlers nao aplicam enforceDomainScope.
+
+src/routes/workOrders.js  [prefixo /api/work-orders]
+  Router: authenticateToken, enforceDomainScope.
+  GET    /                 Lista OS; technician recebe filtragem adicional
+                           para atribuicoes e OS abertas sem atribuicao.
+  GET    /:id              Consulta OS e pecas associadas.
+  POST   /:id/transitions  Regista transicao de estado.
+  GET    /:id/timeline     Lista eventos da OS.
+  POST   /                 Cria OS.
+  PUT    /:id              Atualiza campos da OS e, se fornecido, substitui
+                           a lista de pecas.
+  DELETE /:id              Soft-delete da OS.
+  GET    /:id/parts        Lista pecas aplicadas.
+  POST   /:id/parts        requireRoles('technician','supervisor',
+                           'tenant_admin'); regista peca aplicada.
+  PATCH  /:id/close        requireRoles('tenant_admin','supervisor');
+                           fecha OS e altera estado do ativo.
+  SQL: withTenantContext. POST /:id/transitions nao tem requireRoles global,
+       mas restringe certas transicoes no handler.
+
+src/routes/technicians.js  [prefixo /api/technicians]
+  Router: authenticateToken, enforceDomainScope.
+  GET  /   requireTenant; lista tecnicos ativos do tenant/escopo.
+  POST /   requireTenant; cria tecnico, opcionalmente associado a app_user.
+  SQL: withTenantContext.
+
+src/routes/notifications.js  [prefixo /api/notifications]
+  Router: authenticateToken.
+  GET /   Handler restringe role a technician e exige tenant; lista OS
+          abertas atribuidas ao utilizador/tecnico nas ultimas 48 horas.
+  SQL: withTenantContext.
+
+src/routes/parts.js  [prefixo /api/parts]
+  Router: authenticateToken, enforceDomainScope.
+  GET  /              requireTenant; lista pecas, pesquisa e filtro low_stock.
+  POST /              requireTenant, requireRoles('tenant_admin','supervisor');
+                       cria peca e movimento de stock inicial.
+  POST /:id/restock   requireTenant, requireRoles('tenant_admin','supervisor');
+                       regista entrada/reposicao.
+  POST /:id/withdraw  requireTenant, requireRoles('tenant_admin','supervisor');
+                       regista saida manual.
+  SQL: withTenantContext.
+
+2. AUTORIZACAO E ESCOPO FLEET VS PLANT
+--------------------------------------
+Extracao:
+  - authenticateToken le req.cookies.auth_token e valida JWT com JWT_SECRET.
+  - req.user recebe id, tenantId, role, fullName e operational_scope do token.
+  - req.userScope = req.user.operational_scope || 'fleet'. Portanto, scope
+    ausente no JWT e convertido silenciosamente em fleet.
+  - O login inclui app_users.operational_scope no JWT.
+
+Validacao em enforceDomainScope (src/middlewares/auth.js):
+  - Aceita apenas roles conhecidos; super_admin passa sem tenant/scope.
+  - Para outros roles, exige tenantId e req.userScope em {fleet, plant}.
+  - Pode receber scope pedido via query domain, query operational_scope,
+    header x-operational-scope ou header x-domain. Scope invalido da 400;
+    scope diferente de req.userScope da 403.
+  - Consulta tenants.operational_scope. Se ausente/inexistente retorna 403.
+  - Aceita qualquer scope de utilizador se tenant.operational_scope='mixed';
+    caso contrario exige igualdade entre scope do utilizador e scope do tenant.
+  - Nao consulta default_operational_scope nesta decisao.
+
+403 em GET /api/assets:
+  - Nao ha um bloqueio fleet-only no handler.
+  - Os 403 mais relevantes acontecem antes do handler, no middleware herdado:
+    utilizador sem tenant, scope invalido, scope pedido diferente do token,
+    tenant sem operational_scope ou scope nao permitido pelo tenant.
+  - authenticateToken retorna 401 sem cookie; retorna 403 para token/role
+    invalido/expirado.
+  - requireTenant pode retornar 403 se faltar tenantId.
+  - GET / nao aplica checkTenantLimits; esse middleware so existe no POST /.
+  - GET / nao tem requireRole especifico alem dos roles aceites no middleware
+    de autenticacao/enforceDomainScope.
+  Outros 403 especificos: requireRole(s) (perfil negado), notificacoes
+  (role diferente de technician), restricao de transicao de technician,
+  tentativa de technician aplicar peca numa OS nao atribuida, e limite de
+  tenant atingido no middleware checkTenantLimits.
+
+Business types:
+  - tenants.business_types nao e consultado em src nem declarado nas
+    migracoes versionadas. Nao existe validacao equivalente a
+    tenant.business_types.includes(req.userScope), nem a mensagem
+    "Módulo não contratado para esta empresa.".
+  - A implementacao usa tenants.operational_scope (fleet/plant/mixed).
+
+Filtros SQL de tenant e escopo:
+  - assets: GET / filtra tenant_id e
+    (domain=$scope OR to_jsonb(public.assets)->>'operational_scope'=$scope).
+    Nas migracoes consultadas, assets tem domain; operational_scope nao e
+    declarado para assets. As outras operacoes usam domain=$scope quando
+    req.userScope existe, alem de tenant_id. Documentos verificam o ativo
+    scoped antes de listar/inserir documentos.
+  - workOrders: listagem filtra (assets.domain=$scope OR
+    work_orders.domain=$scope). Consultas por id, transicoes, timeline,
+    criacao, edicao, delete, pecas e close incluem domain do ativo/OS/peca
+    conforme apropriado. O helper de assigneeExists limita tenant, mas nao
+    limita domain.
+  - parts: GET, restock e withdraw filtram tenant e domain. Criacao grava
+    domain=req.userScope.
+  - users: filtra app_users.tenant_id e operational_scope=req.userScope.
+  - technicians: GET filtra tenant, nao eliminado, ativo e t.domain;
+    associacao de utilizador e validada por tenant e role technician.
+  - fuel: GET nao tem WHERE tenant_id/domain explicito; JOIN exige
+    assets.tenant_id=fuel_logs.tenant_id. POST grava tenant_id do token,
+    mas nao consulta/valida explicitamente o ativo ou domain antes do INSERT.
+  - notifications: procura technician e work_orders pelo tenant; nao inclui
+    domain no SELECT de OS.
+  - adminTenants/superAdmin: operacoes administrativas cross-tenant usam
+    role super_admin e contexto tenant nulo; nao sao escopadas por domain.
+  - A cobertura RLS visivel nas migracoes inclui work_orders, technicians,
+    work_order_events e asset_documents. Nao foram encontradas politicas nas
+    migracoes presentes para assets, app_users, parts ou fuel_logs; o schema
+    base pode estar fora deste repositorio.
+
+3. CONTRATOS DE DADOS E PAYLOADS
+--------------------------------
+Ordens de servico (src/routes/workOrders.js):
+
+POST /api/work-orders
+  Espera:
+    assetId: UUID obrigatorio
+    title: string obrigatoria, nao vazia apos trim, max. 255
+    orderType: corrective | preventive | inspection (obrigatorio)
+    priority: low | medium | high | urgent (obrigatorio)
+    description: string ou null (opcional)
+    assignedTo: UUID ou null (opcional)
+    meterAtService: numero finito >= 0 ou null (opcional)
+    osNumber: string nao vazia ate 255 (opcional; gerado se omitido)
+    parts: array opcional de {partId: UUID, quantity: numero finito > 0}.
+  Asset e procurado pelo tenant e domain e bloqueado FOR UPDATE. OS
+  corrective coloca o ativo em breakdown. Pecas sao validadas no mesmo
+  tenant/domain da OS, e gravadas em work_order_parts dentro da transacao.
+
+PUT /api/work-orders/:id
+  Campos opcionais reconhecidos:
+    status, priority, title, description, meterAtService, assignedTo,
+    resolutionNotes, completedAt, parts.
+  Status aceites pelo handler: open, in_progress, waiting_parts, blocked,
+  completed, cancelled. assigned nao esta na lista, apesar de existir na
+  constraint SQL versionada e ser usado como estado de origem em start.
+  assignedTo pode ser null/string vazia para limpar; outros valores devem
+  ser UUID. completedAt aceita data string parseavel ou null. parts, quando
+  presente (incluindo []), substitui a lista existente. Campos desconhecidos
+  como assetId, orderType, osNumber, downtimeHours e custos nao sao aplicados.
+  Se nenhum campo reconhecido for enviado, retorna 400.
+
+PATCH /api/work-orders/:id
+  Nao existe handler generico registado.
+
+PATCH /api/work-orders/:id/close
+  Existe com este metodo/caminho, nao como POST /:id/close. Requer role
+  tenant_admin ou supervisor e os tres campos numericos finitos nao
+  negativos: downtimeHours, partsCostMzn, laborCostMzn. Nao valida
+  explicitamente formato UUID do :id nem valida estado previo da OS.
+
+POST /api/work-orders/:id/transitions (endpoint adicional)
+  Recebe eventType: start|pause|resume|interrupt|complete; reason e
+  justification obrigatorios e nao vazios para pause/interrupt; aceita
+  meterAtService >= 0. Technician nao pode fazer interrupt. Estados origem
+  e destino sao verificados pelo handler.
+
+Chave assignedTo / coluna assigned_to:
+  - O payload HTTP usa camelCase assignedTo; SQL e coluna assigned_to.
+  - assigneeExists procura UUID tanto em technicians.id (nao eliminado)
+    como em app_users.id (is_active=true), restringindo ambos ao tenant.
+    Portanto aceita UUID dos dois tipos.
+  - Nao valida role do registo app_users, domain operacional, nem
+    technicians.status='active'. UUID de tecnico inativo sem deleted_at
+    continua aceito. A migracao
+    20261009120000_allow_technician_assignment_ids.sql remove a FK antiga
+    work_orders_assigned_to_fkey para permitir identificadores que nao
+    sejam app_users.id.
+  - A validacao e por tenant, mas nao pelo domain da OS.
+
+Pecas em OS:
+  - POST de OS e PUT da OS aceitam parts=[{partId, quantity}].
+  - POST /:id/parts aceita {partId, quantity, notes?}; roles permitidos:
+    technician, supervisor, tenant_admin. Technician so pode aplicar em OS
+    atribuida ao seu user id ou technician id.
+  - work_order_parts recebe tenant_id, work_order_id, part_id, quantity,
+    unit_cost, applied_by e, no endpoint individual, notes.
+  - Criacao/substituicao por saveWorkOrderParts nao persiste notes.
+  - O helper bloqueia pecas com FOR UPDATE e confirma tenant/domain; grava
+    quantidades, mas nao reduz current_stock nem cria stock_movement.
+    Na substituicao, soma quantidades antigas ao stock antes de apagar as
+    linhas antigas, mas nao desconta as novas.
+
+Pecas / inventario (src/routes/parts.js):
+  POST /api/parts aceita:
+    name (obrigatorio);
+    referencia por partNumber OU part_number OU oem_reference (obrigatoria);
+    category (default 'Geral');
+    location OU warehouse_location;
+    unitOfMeasure OU unit_of_measure (default 'un');
+    currentStock OU current_stock (default 0);
+    minStock OU min_stock (default 0);
+    unitCost OU unit_cost (default 0).
+  Persiste a referencia em parts.part_number e localizacao em location.
+  current/min stock e custo sao convertidos com Number(), sem validacao
+  explicita de finitude/sinal no handler. Nome/referencia mal tipados podem
+  provocar erro de .trim() em vez de resposta de validacao 400.
+
+  POST /api/parts/:id/withdraw esta registado e exige:
+    quantity: numero finito > 0 (JSON number);
+    notes?: string|null; reason?: string|null.
+    Faz lock da peca, valida saldo suficiente, decrementa current_stock e
+    regista stock_movement 'out' com quantidade negativa.
+
+  POST /api/parts/:id/restock esta registado e exige:
+    quantity: numero finito > 0; unitCost: numero finito >= 0;
+    notes?: string|null. Atualiza media ponderada de unit_cost, incrementa
+    current_stock e regista stock_movement 'in'.
+  Ambos exigem tenant_admin ou supervisor e UUID para :id. Nao aceitam
+  aliases snake_case no payload de restock/withdraw.
+  Os handlers estao implementados; entretanto, nenhuma migracao versionada
+  cria public.parts, public.stock_movements ou public.work_order_parts.
+  Disponibilidade real depende de essas tabelas existirem no banco alvo.
+
+4. TRANSACOES, LOCKS E TRIGGERS
+-------------------------------
+Transacoes:
+  - src/db.js: withTenantContext() faz pool.connect(), BEGIN, configura
+    app.current_tenant e app.current_user_role com set_config(..., true),
+    executa callback, COMMIT; em erro tenta ROLLBACK e relanca o erro.
+    Erros do proprio ROLLBACK sao ignorados.
+  - Chamadas de withTenantContext em handlers mantem as queries daquele
+    callback na mesma transacao.
+  - src/routes/superAdmin.js POST /tenants implementa transacao manual
+    BEGIN/COMMIT/ROLLBACK e seta o mesmo contexto.
+  - Login consulta pool diretamente sem withTenantContext. /me e /logout
+    nao executam SQL.
+
+FOR UPDATE encontrado:
+  - assets.js PATCH /:id/meter: lock do ativo antes de validar/atualizar
+    current_meter.
+  - parts.js POST /:id/restock e POST /:id/withdraw: lock da peca antes
+    de alterar saldo.
+  - workOrders.js helper saveWorkOrderParts: lock das pecas consultadas.
+  - workOrders.js POST /:id/transitions: lock da OS.
+  - workOrders.js POST /: (criacao): lock do ativo.
+  - workOrders.js POST /:id/parts: lock da OS.
+  - workOrders.js PATCH /:id/close: locks da OS e do ativo.
+  Todos estes locks ocorrem dentro de withTenantContext(), logo dentro de
+  transacao. Nao foi encontrado lock equivalente na atualizacao PUT /:id
+  da OS.
+
+Triggers e calculo de stock:
+  - Nao ha CREATE TRIGGER nas migracoes versionadas.
+  - As funcoes SQL visiveis incluem generate_work_order_number(); nao e
+    trigger e nao atualiza stock.
+  - Restock/withdraw e inventario inicial fazem atualizacao explicita de
+    parts.current_stock e insercao em stock_movements no codigo da API.
+  - Aplicacao de pecas a OS nao atualiza saldo de stock, apesar de persistir
+    work_order_parts. Nao e possivel excluir triggers criados manualmente
+    fora das migracoes deste repositorio.
+
+5. INCONGRUENCIAS E RISCOS TECNICOS IDENTIFICADOS
+-------------------------------------------------
+I-01 [Alta] Escopo de abastecimentos inconsistente:
+  fuelLogs GET nao filtra explicitamente tenant_id nem domain e POST nao
+  comprova explicitamente que assetId pertence ao tenant/domain. A protecao
+  efetiva depende de RLS/constraints existentes no banco, que nao estao
+  documentadas nas migracoes versionadas para fuel_logs.
+
+I-02 [Alta] Inventario nao reflete pecas consumidas por OS:
+  work_order_parts e atualizado sem reducao correspondente de
+  parts.current_stock e sem stock_movements. O utilizador pode aplicar
+  pecas em OS sem o saldo baixar; edicao com substituicao tambem nao
+  desconta as novas quantidades.
+
+I-03 [Alta] Falta de migracoes de schema para tabelas usadas:
+  As migracoes verificadas nao criam parts, work_order_parts,
+  stock_movements nem fuel_logs. Os handlers dependem de schema externo ou
+  de migracoes nao versionadas; a auditoria nao pode confirmar que esses
+  endpoints inicializam num banco criado apenas a partir deste repositorio.
+
+I-04 [Media] Escopo de assignee menos estrito que escopo da OS:
+  assignedTo aceita utilizador ativo de qualquer role, e tecnico nao
+  eliminado sem verificar status ativo; a consulta nao confere
+  operational_scope/domain. Pode atribuir OS a utilizador fora do dominio
+  operacional correspondente.
+
+I-05 [Media] Estados de OS inconsistentes:
+  A migracao de eventos permite status 'assigned' e a rota transitions
+  considera 'assigned' estado de origem para start; PUT /:id rejeita
+  'assigned' pelo Set STATUSES. Um cliente nao pode definir esse estado
+  por PUT apesar do schema o permitir.
+
+I-06 [Media] Endpoints/payloads de fechar/editar OS discrepantes:
+  Nao existe PATCH /api/work-orders/:id generico nem POST
+  /api/work-orders/:id/close. A implementacao e PUT /:id para edicao e
+  PATCH /:id/close para fechamento, com tres custos obrigatorios. Clientes
+  que chamem os metodos/caminhos pedidos nao atingem esses handlers.
+
+I-07 [Media] Admin inicial de tenant plant pode ficar em fleet:
+  adminTenants POST /tenants permite operationalScope='plant', mas cria
+  app_users sem operational_scope explicito. A migracao define default
+  fleet; enforceDomainScope rejeita fleet num tenant apenas plant. A conta
+  de tenant_admin criada pode, portanto, receber 403 nos modulos scoped.
+
+I-08 [Media] Duas APIs de criacao de tenant:
+  /api/super-admin/tenants (superAdmin.js) e /api/admin/tenants
+  (adminTenants.js) criam tenants, mas aceitam payloads diferentes. A rota
+  antiga nao aceita maxUsersLimit nem operationalScope/default scope e
+  usa defaults do schema; pode produzir tenants com configuracao diferente
+  da rota admin.
+
+I-09 [Media] Sem validacao tenants.business_types:
+  O requisito de produto/licenciamento por business_types nao esta
+  implementado no codigo/migracoes encontrados. A autorizacao usa
+  operational_scope; business_types e a resposta especifica de modulo
+  contratado nao existem.
+
+I-10 [Media] Escopo do inventario em OS nao atualiza saldo:
+  Relacionado a I-02, mas tambem ha diferenca semantica: work_order_parts
+  guarda custo unitario e consumo, enquanto stock_movements e usado apenas
+  pelas operacoes explicitas de inventario inicial/reposicao/saida manual.
+  Nao ha reconciliacao visivel entre os dois fluxos.
+
+I-11 [Baixa/Media] Validacao inconsistente de ids/campos:
+  Diversas rotas usam regex UUID; outras passam ids diretamente para SQL.
+  PostgreSQL normalmente infere tipo de parametro a partir da coluna, logo
+  ausencia de ::uuid isoladamente nao prova defeito. Mais concretamente,
+  PATCH /:id/close nao valida o UUID e os handlers de assets PUT/DELETE
+  tambem nao fazem validacao sintatica previa.
+
+I-12 [Baixa/Media] Campos de ativo usam COALESCE no PUT:
+  null e tratado como "manter valor atual", nao como limpar campos nullable.
+  O PUT tambem nao valida explicitamente status/categoria/tipos antes da
+  query. A validacao final fica a cargo do schema PostgreSQL.
+
+I-13 [Baixa] Caminho de documentos:
+  GET /api/assets/:id/documents valida o domain do ativo antes da consulta,
+  depois lista documentos por asset_id e tenant_id sem repetir domain.
+  A autorizacao depende da validacao inicial e da politica RLS de
+  asset_documents definida na migracao.
+
+I-14 [Baixa] Erros/rollback:
+  withTenantContext suprime erros ocorridos durante ROLLBACK. Alguns
+  handlers retornam diretamente mensagem de erro PostgreSQL (login) ou
+  respostas 500 especificas, enquanto outros delegam para next(error).
+  server.js nao registra middleware proprio de tratamento de erros.
+
+I-15 [Baixa/Media] GET de OS pode incluir ativo arquivado:
+  GET /api/work-orders/:id junta assets e limita tenant/domain, mas nao
+  verifica assets.deleted_at IS NULL. Uma OS nao eliminada pode ser
+  retornada com dados do ativo ja soft-deleted.
+
+Limites da auditoria:
+  - Foram examinados os ficheiros src, package.json e as cinco migracoes
+    SQL versionadas. Nao houve ligacao ao PostgreSQL/Render para comparar
+    schema, policies, triggers ou dados efetivamente implantados.
+  - O repositorio nao inclui frontend React nem contratos OpenAPI/Swagger;
+    nao e possivel afirmar discrepancias com payloads reais do frontend.
+  - Nao foi executada bateria de testes: package.json nao define script de
+    teste e a tarefa solicitada foi produzir auditoria estatica factual.

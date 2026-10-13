@@ -1,0 +1,5 @@
+ALTER TABLE public.work_orders
+  ADD COLUMN IF NOT EXISTS parts_cost numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS labor_cost numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS total_cost numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS total_cost_mzn numeric NOT NULL DEFAULT 0;

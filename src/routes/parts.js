@@ -149,7 +149,7 @@ router.post(
 );
 
 router.post(
-  '/:id/restock',
+  ['/:id/restock', '/:id/replenish'],
   requireTenant,
   requireRoles('tenant_admin', 'supervisor'),
   async (req, res) => {

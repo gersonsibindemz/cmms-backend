@@ -122,7 +122,7 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
   }
 });
 
-router.put('/:id', async (req, res, next) => {
+async function updateUser(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
   }
@@ -238,6 +238,49 @@ router.put('/:id', async (req, res, next) => {
     if (error.code === '23505') {
       return res.status(409).json({ error: 'Já existe um utilizador com este email neste tenant.' });
     }
+    return next(error);
+  }
+}
+
+router.put('/:id', updateUser);
+router.patch('/:id', updateUser);
+
+router.delete('/:id', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const result = await client.query(
+        `UPDATE public.app_users
+         SET is_active = false
+         WHERE id = $1::uuid
+           AND tenant_id = $2::uuid
+           AND operational_scope = $3
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, created_at`,
+        [req.params.id, req.user.tenantId, req.userScope],
+      );
+      const user = result.rows[0];
+      if (!user) return null;
+
+      await client.query(
+        `UPDATE public.technicians
+         SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+         WHERE tenant_id = $1::uuid
+           AND user_id = $2::uuid
+           AND deleted_at IS NULL`,
+        [req.user.tenantId, user.id],
+      );
+      return user;
+    });
+
+    if (!outcome) {
+      return res.status(404).json({ error: 'Utilizador não encontrado neste tenant.' });
+    }
+    return res.json({ user: outcome });
+  } catch (error) {
     return next(error);
   }
 });

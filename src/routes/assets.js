@@ -440,7 +440,7 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
 });
 
 // 4. ATUALIZAR ATIVO (Edição com auditoria automática pelo trigger)
-router.put('/:id', requireTenant, async (req, res) => {
+async function updateAsset(req, res) {
   try {
     const { id } = req.params;
     const {
@@ -508,7 +508,10 @@ router.put('/:id', requireTenant, async (req, res) => {
     console.error('Erro ao atualizar ativo:', error);
     res.status(500).json({ error: 'Erro interno ao atualizar ativo' });
   }
-});
+}
+
+router.put('/:id', requireTenant, updateAsset);
+router.patch('/:id', requireTenant, updateAsset);
 
 // 5. SOFT-DELETE (Inativação com auditoria)
 router.delete('/:id', requireTenant, async (req, res) => {

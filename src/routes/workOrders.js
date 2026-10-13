@@ -33,6 +33,16 @@ function isValidPartsPayload(parts) {
   ));
 }
 
+function normalizePartsPayload(parts) {
+  if (!Array.isArray(parts)) return parts;
+  return parts.map((part) => {
+    if (part === null || typeof part !== 'object') return part;
+    const partId = part.partId || part.part_id || part.id;
+    const quantity = Number(part.quantity || 1);
+    return { ...part, partId, quantity };
+  });
+}
+
 async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
   const result = await client.query(
     `SELECT work_order_parts.id,
@@ -289,7 +299,7 @@ router.get('/:id', requireTenant, async (req, res, next) => {
   }
 });
 
-router.post('/:id/transitions', requireTenant, async (req, res, next) => {
+async function handleWorkOrderTransition(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
   }
@@ -431,7 +441,19 @@ router.post('/:id/transitions', requireTenant, async (req, res, next) => {
   } catch (error) {
     return next(error);
   }
-});
+}
+
+function transitionAlias(eventType) {
+  return (req, res, next) => {
+    req.body = { ...(req.body ?? {}), eventType };
+    return handleWorkOrderTransition(req, res, next);
+  };
+}
+
+router.post('/:id/transitions', requireTenant, handleWorkOrderTransition);
+router.post('/:id/start', requireTenant, transitionAlias('start'));
+router.post('/:id/pause', requireTenant, transitionAlias('pause'));
+router.post('/:id/resume', requireTenant, transitionAlias('resume'));
 
 router.get('/:id/timeline', requireTenant, async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
@@ -494,6 +516,7 @@ router.post('/', requireTenant, async (req, res, next) => {
     osNumber,
     parts,
   } = req.body ?? {};
+  const normalizedParts = parts === undefined ? undefined : normalizePartsPayload(parts);
 
   if (
     typeof assetId !== 'string' ||
@@ -513,7 +536,7 @@ router.post('/', requireTenant, async (req, res, next) => {
     (osNumber !== undefined && (
       typeof osNumber !== 'string' || !osNumber.trim() || osNumber.trim().length > 255
     )) ||
-    (parts !== undefined && !isValidPartsPayload(parts))
+    (parts !== undefined && !isValidPartsPayload(normalizedParts))
   ) {
     return res.status(400).json({ message: 'Dados obrigatórios da ordem de serviço inválidos.' });
   }
@@ -575,13 +598,13 @@ router.post('/', requireTenant, async (req, res, next) => {
       );
 
       const workOrder = result.rows[0];
-      if (parts?.length) {
+      if (normalizedParts?.length) {
         const savedParts = await saveWorkOrderParts(client, {
           tenantId: req.user.tenantId,
           workOrderId: workOrder.id,
           domain: workOrder.domain,
           appliedBy: req.user.id,
-          parts,
+          parts: normalizedParts,
         });
         workOrder.parts = savedParts.parts;
       } else {
@@ -608,12 +631,13 @@ router.post('/', requireTenant, async (req, res, next) => {
   }
 });
 
-router.put('/:id', requireTenant, async (req, res, next) => {
+async function updateWorkOrder(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
   }
 
   const body = req.body ?? {};
+  const normalizedParts = body.parts === undefined ? undefined : normalizePartsPayload(body.parts);
   const fields = [];
   const values = [req.params.id, req.user.tenantId];
   const addField = (column, value) => {
@@ -692,7 +716,7 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     fields.push('completed_at = COALESCE(completed_at, NOW())');
   }
 
-  if (body.parts !== undefined && !isValidPartsPayload(body.parts)) {
+  if (body.parts !== undefined && !isValidPartsPayload(normalizedParts)) {
     return res.status(400).json({ message: 'Lista de peças inválida.' });
   }
   const shouldSyncParts = body.parts !== undefined;
@@ -731,7 +755,7 @@ router.put('/:id', requireTenant, async (req, res, next) => {
           workOrderId: workOrder.id,
           domain: workOrder.domain,
           appliedBy: req.user.id,
-          parts: body.parts,
+          parts: normalizedParts,
           replace: true,
         });
         workOrder.parts = savedParts.parts;
@@ -759,7 +783,10 @@ router.put('/:id', requireTenant, async (req, res, next) => {
     }
     return next(error);
   }
-});
+}
+
+router.put('/:id', requireTenant, updateWorkOrder);
+router.patch('/:id', requireTenant, updateWorkOrder);
 
 router.delete('/:id', requireTenant, async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
@@ -959,15 +986,24 @@ router.post(
   },
 );
 
-router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervisor'), async (req, res, next) => {
-  const { downtimeHours, partsCostMzn, laborCostMzn } = req.body ?? {};
+async function closeWorkOrder(req, res, next) {
+  const body = req.body ?? {};
+  const downtimeHours = body.downtime_hours || body.downtimeHours || 0;
+  const partsCostMzn = body.parts_cost_mzn || body.partsCostMzn ||
+    body.parts_cost || body.partsCost || 0;
+  const laborCostMzn = body.labor_cost_mzn || body.laborCostMzn ||
+    body.labor_cost || body.laborCost || 0;
+  const resolutionNotes = body.resolution_notes || body.resolutionNotes || body.notes || '';
 
   if (
     [downtimeHours, partsCostMzn, laborCostMzn].some(
       (value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0,
-    )
+    ) ||
+    typeof resolutionNotes !== 'string'
   ) {
-    return res.status(400).json({ message: 'Horas de inatividade e custos devem ser números não negativos.' });
+    return res.status(400).json({
+      message: 'Horas de inatividade e custos devem ser números não negativos e as notas devem ser texto.',
+    });
   }
 
   try {
@@ -999,17 +1035,37 @@ router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervis
       const updatedOrder = await client.query(
         `UPDATE public.work_orders
          SET status = 'completed',
-             completed_at = COALESCE(completed_at, NOW()),
+             completed_at = NOW(),
              updated_at = NOW(),
              downtime_hours = $1,
              parts_cost_mzn = $2,
-             labor_cost_mzn = $3
-         WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-           ${req.userScope ? 'AND domain = $6' : ''}
+             labor_cost_mzn = $3,
+             parts_cost = $2,
+             labor_cost = $3,
+             total_cost = $2 + $3,
+             total_cost_mzn = $2 + $3,
+             resolution_notes = $4
+         WHERE id = $5 AND tenant_id = $6 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $7' : ''}
          RETURNING *`,
         req.userScope
-          ? [downtimeHours, partsCostMzn, laborCostMzn, req.params.id, req.user.tenantId, req.userScope]
-          : [downtimeHours, partsCostMzn, laborCostMzn, req.params.id, req.user.tenantId],
+          ? [
+              downtimeHours,
+              partsCostMzn,
+              laborCostMzn,
+              resolutionNotes,
+              req.params.id,
+              req.user.tenantId,
+              req.userScope,
+            ]
+          : [
+              downtimeHours,
+              partsCostMzn,
+              laborCostMzn,
+              resolutionNotes,
+              req.params.id,
+              req.user.tenantId,
+            ],
       );
 
       await client.query(
@@ -1033,6 +1089,19 @@ router.patch('/:id/close', requireTenant, requireRoles('tenant_admin', 'supervis
   } catch (error) {
     return next(error);
   }
-});
+}
+
+router.patch(
+  '/:id/close',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  closeWorkOrder,
+);
+router.post(
+  '/:id/complete',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  closeWorkOrder,
+);
 
 export default router;
