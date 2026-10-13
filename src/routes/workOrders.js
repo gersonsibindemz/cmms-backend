@@ -229,11 +229,8 @@ async function saveWorkOrderParts(client, {
 router.get('/', requireTenant, async (req, res, next) => {
   const { id: userId, role, tenantId } = req.user;
   const filters = [];
-  const values = [tenantId];
-  if (req.userScope) {
-    values.push(req.userScope);
-    filters.push(`(assets.domain = $${values.length} OR work_orders.domain = $${values.length})`);
-  }
+  const values = [tenantId, req.userScope];
+  filters.push('(assets.domain = $2 OR work_orders.domain = $2)');
 
   for (const [queryKey, column] of [
     ['status', 'work_orders.status'],
@@ -294,34 +291,37 @@ router.get('/', requireTenant, async (req, res, next) => {
                     AND archived_assets.tenant_id = work_orders.tenant_id
                     AND archived_assets.deleted_at IS NOT NULL
                 )) AS asset_deleted,
-                to_jsonb(assigned_technician) AS technician,
-                assigned_user.full_name AS assigned_to_name
+                to_jsonb(tech) AS technician,
+                usr.full_name AS assigned_to_name,
+                COALESCE(tech.name, usr.full_name, NULL) AS assigned_technician_name
          FROM public.work_orders AS work_orders
-         LEFT JOIN public.assets AS assets
+         INNER JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
            AND assets.tenant_id = work_orders.tenant_id
            AND assets.deleted_at IS NULL
-           ${req.userScope ? 'AND assets.domain = $2' : ''}
-         LEFT JOIN public.app_users AS assigned_user
-           ON assigned_user.id = work_orders.assigned_to
-          AND assigned_user.tenant_id = work_orders.tenant_id
-         LEFT JOIN public.technicians AS assigned_technician
-           ON (
-             assigned_technician.user_id = work_orders.assigned_to
-             OR assigned_technician.id = work_orders.assigned_to
-           )
-          AND assigned_technician.tenant_id = work_orders.tenant_id
-          AND assigned_technician.deleted_at IS NULL
-          ${req.userScope ? 'AND assigned_technician.domain = $2' : ''}
+         LEFT JOIN public.technicians AS tech
+           ON tech.id = work_orders.assigned_to
+          AND tech.tenant_id = work_orders.tenant_id
+          AND tech.deleted_at IS NULL
+          AND tech.domain = $2
+         LEFT JOIN public.app_users AS usr
+           ON usr.id = work_orders.assigned_to
+          AND usr.tenant_id = work_orders.tenant_id
          WHERE work_orders.tenant_id = $1
            AND work_orders.deleted_at IS NULL
+           AND (assets.domain = $2 OR work_orders.domain = $2)
            ${whereFilters}
          ORDER BY work_orders.created_at DESC`,
         queryValues,
       );
     });
 
-    return res.json({ workOrders: result.rows });
+    return res.json({
+      workOrders: result.rows.map((workOrder) => ({
+        ...workOrder,
+        assignedTechnicianName: workOrder.assigned_technician_name,
+      })),
+    });
   } catch (error) {
     return next(error);
   }
