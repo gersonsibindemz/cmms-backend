@@ -2,7 +2,6 @@ import jwt from 'jsonwebtoken';
 import { withTenantContext } from '../db.js';
 
 const DOMAIN_SCOPES = new Set(['fleet', 'plant']);
-const SCOPED_ROLES = new Set(['supervisor', 'technician', 'driver_operator']);
 const USER_ROLES = new Set([
   'super_admin',
   'tenant_admin',
@@ -31,6 +30,7 @@ export function authenticateToken(req, res, next) {
       fullName: payload.fullName,
       operational_scope: payload.operational_scope,
     };
+    req.userScope = req.user.operational_scope || 'fleet';
 
     return next();
   } catch {
@@ -58,18 +58,11 @@ export function enforceDomainScope(req, res, next) {
   }
   if (req.user.role === 'super_admin') return next();
 
-  if (SCOPED_ROLES.has(req.user.role)) {
-    const scope = req.user.operational_scope;
-    if (!DOMAIN_SCOPES.has(scope)) {
-      return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
-    }
-    req.userScope = scope;
-    return next();
-  }
-
-  if (req.user.role !== 'tenant_admin') return next();
   if (!req.user.tenantId) {
     return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+  }
+  if (!DOMAIN_SCOPES.has(req.userScope)) {
+    return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
   }
 
   const requestedScope = req.query.domain
@@ -78,6 +71,9 @@ export function enforceDomainScope(req, res, next) {
     ?? req.get('x-domain');
   if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
     return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+  if (requestedScope !== undefined && requestedScope !== req.userScope) {
+    return res.status(403).json({ error: 'O escopo solicitado não corresponde ao utilizador.' });
   }
 
   withTenantContext(req.user.tenantId, req.user.role, (client) =>
@@ -93,13 +89,8 @@ export function enforceDomainScope(req, res, next) {
       return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
     }
 
-    if (tenantScope === 'mixed') {
-      req.userScope = requestedScope ?? result.rows[0].default_operational_scope;
-    } else {
-      if (requestedScope !== undefined && requestedScope !== tenantScope) {
-        return res.status(403).json({ error: 'O escopo solicitado não está disponível neste tenant.' });
-      }
-      req.userScope = tenantScope;
+    if (tenantScope !== 'mixed' && req.userScope !== tenantScope) {
+      return res.status(403).json({ error: 'O escopo do utilizador não está disponível neste tenant.' });
     }
     return next();
   }).catch(next);

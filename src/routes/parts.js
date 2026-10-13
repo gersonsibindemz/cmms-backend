@@ -21,7 +21,7 @@ function requireTenant(req, res, next) {
 router.get('/', requireTenant, async (req, res, next) => {
   const values = [req.user.tenantId];
   const filters = ['tenant_id = $1', 'deleted_at IS NULL'];
-  if (req.userScope && req.user.role !== 'super_admin') {
+  if (req.userScope) {
     values.push(req.userScope);
     filters.push(`domain = $${values.length}`);
   }
@@ -110,7 +110,7 @@ router.post(
            RETURNING *`,
           [
             req.user.tenantId,
-            req.userScope || 'fleet',
+            req.userScope,
             finalPartNumber,
             finalName,
             finalCategory,

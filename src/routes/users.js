@@ -27,8 +27,9 @@ router.get('/', async (req, res, next) => {
                 is_active, created_at
          FROM public.app_users
          WHERE tenant_id = $1::uuid
+           AND operational_scope = $2
          ORDER BY full_name ASC`,
-        [req.user.tenantId],
+        [req.user.tenantId, req.userScope],
       ),
     );
     return res.json({ users: result.rows });
@@ -38,7 +39,7 @@ router.get('/', async (req, res, next) => {
 });
 
 router.post('/', checkTenantLimits('users'), async (req, res, next) => {
-  const { name, email, password, role, operationalScope } = req.body ?? {};
+  const { name, email, password, role, operational_scope: operationalScope } = req.body ?? {};
   if (
     typeof name !== 'string' ||
     !name.trim() ||
@@ -48,7 +49,7 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
     typeof password !== 'string' ||
     password.length < 8 ||
     !USER_ROLES.has(role) ||
-    (operationalScope !== undefined && !OPERATIONAL_SCOPES.has(operationalScope))
+    !OPERATIONAL_SCOPES.has(operationalScope)
   ) {
     return res.status(400).json({ error: 'Dados do utilizador inválidos.' });
   }
@@ -65,12 +66,11 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
       const tenantScope = tenantResult.rows[0]?.operational_scope;
       if (!tenantScope) return { tenantNotFound: true };
 
-      const userScope = operationalScope ?? req.userScope ?? (
-        tenantScope === 'mixed' ? null : tenantScope
-      );
+      const userScope = operationalScope;
       if (
         !userScope ||
         !OPERATIONAL_SCOPES.has(userScope) ||
+        userScope !== req.userScope ||
         (tenantScope !== 'mixed' && userScope !== tenantScope)
       ) {
         return { invalidScope: true };
@@ -122,6 +122,126 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
   }
 });
 
+router.put('/:id', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+
+  const {
+    name,
+    email,
+    role,
+    operational_scope: operationalScope,
+    password,
+  } = req.body ?? {};
+  if (
+    typeof name !== 'string' ||
+    !name.trim() ||
+    name.trim().length > 255 ||
+    typeof email !== 'string' ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+    !USER_ROLES.has(role) ||
+    !OPERATIONAL_SCOPES.has(operationalScope) ||
+    operationalScope !== req.userScope ||
+    (password !== undefined && (typeof password !== 'string' || password.length < 8))
+  ) {
+    return res.status(400).json({ error: 'Dados do utilizador inválidos.' });
+  }
+
+  try {
+    const passwordHash = password === undefined ? null : await bcrypt.hash(password, 12);
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const tenantResult = await client.query(
+        `SELECT operational_scope
+         FROM public.tenants
+         WHERE id = $1::uuid`,
+        [req.user.tenantId],
+      );
+      const tenantScope = tenantResult.rows[0]?.operational_scope;
+      if (!tenantScope) return { tenantNotFound: true };
+      if (tenantScope !== 'mixed' && operationalScope !== tenantScope) {
+        return { invalidScope: true };
+      }
+
+      const userResult = await client.query(
+        `UPDATE public.app_users
+         SET email = $1,
+             full_name = $2,
+             role = $3::public.user_role,
+             operational_scope = $4,
+             password_hash = COALESCE($5, password_hash)
+         WHERE id = $6::uuid
+           AND tenant_id = $7::uuid
+           AND operational_scope = $8
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, created_at`,
+        [
+          email.trim().toLowerCase(),
+          name.trim(),
+          role,
+          operationalScope,
+          passwordHash,
+          req.params.id,
+          req.user.tenantId,
+          req.userScope,
+        ],
+      );
+      const user = userResult.rows[0];
+      if (!user) return { userNotFound: true };
+
+      if (role === 'technician') {
+        await client.query(
+          `INSERT INTO public.technicians (
+             tenant_id, user_id, name, email, domain
+           )
+           VALUES ($1::uuid, $2::uuid, $3, $4, $5)
+           ON CONFLICT (tenant_id, user_id) WHERE user_id IS NOT NULL
+           DO UPDATE SET name = EXCLUDED.name,
+                         email = EXCLUDED.email,
+                         domain = EXCLUDED.domain,
+                         status = 'active',
+                         deleted_at = NULL,
+                         updated_at = NOW()`,
+          [
+            req.user.tenantId,
+            user.id,
+            name.trim(),
+            email.trim().toLowerCase(),
+            operationalScope,
+          ],
+        );
+      } else {
+        await client.query(
+          `UPDATE public.technicians
+           SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+           WHERE tenant_id = $1::uuid
+             AND user_id = $2::uuid
+             AND deleted_at IS NULL`,
+          [req.user.tenantId, user.id],
+        );
+      }
+
+      return { user };
+    });
+
+    if (outcome.tenantNotFound) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    if (outcome.invalidScope) {
+      return res.status(400).json({ error: 'Escopo operacional inválido para este tenant.' });
+    }
+    if (outcome.userNotFound) {
+      return res.status(404).json({ error: 'Utilizador não encontrado neste escopo.' });
+    }
+    return res.json({ user: outcome.user });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Já existe um utilizador com este email neste tenant.' });
+    }
+    return next(error);
+  }
+});
+
 router.patch('/:id/toggle-status', async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
@@ -133,9 +253,10 @@ router.patch('/:id/toggle-status', async (req, res, next) => {
          SET is_active = NOT is_active
          WHERE id = $1::uuid
            AND tenant_id = $2::uuid
+           AND operational_scope = $3
          RETURNING id, tenant_id, email, full_name AS name, role,
                    operational_scope, is_active`,
-        [req.params.id, req.user.tenantId],
+        [req.params.id, req.user.tenantId, req.userScope],
       ),
     );
     if (result.rowCount === 0) {

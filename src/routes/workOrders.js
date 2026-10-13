@@ -62,13 +62,17 @@ async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
 
 async function assigneeExists(client, assignedTo, tenantId) {
   const result = await client.query(
-    `SELECT id
+    `SELECT id::text AS id
      FROM public.technicians
-     WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+     WHERE id::text = $1::text
+       AND tenant_id::text = $2::text
+       AND deleted_at IS NULL
      UNION
-     SELECT id
+     SELECT id::text AS id
      FROM public.app_users
-     WHERE id = $1 AND tenant_id = $2 AND is_active = true
+     WHERE id::text = $1::text
+       AND tenant_id::text = $2::text
+       AND is_active = true
      LIMIT 1`,
     [assignedTo, tenantId],
   );
@@ -148,7 +152,7 @@ router.get('/', requireTenant, async (req, res, next) => {
   const values = [tenantId];
   if (req.userScope) {
     values.push(req.userScope);
-    filters.push(`work_orders.domain = $${values.length}`);
+    filters.push(`(assets.domain = $${values.length} OR work_orders.domain = $${values.length})`);
   }
 
   for (const [queryKey, column] of [
@@ -208,9 +212,8 @@ router.get('/', requireTenant, async (req, res, next) => {
          FROM public.work_orders AS work_orders
          JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
-          AND assets.tenant_id = work_orders.tenant_id
-          AND assets.deleted_at IS NULL
-          ${req.userScope ? 'AND assets.domain = $2' : ''}
+           AND assets.tenant_id = work_orders.tenant_id
+           AND assets.deleted_at IS NULL
          LEFT JOIN public.app_users AS assigned_user
            ON assigned_user.id = work_orders.assigned_to
           AND assigned_user.tenant_id = work_orders.tenant_id

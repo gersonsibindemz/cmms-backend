@@ -249,9 +249,7 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', requireTenant, async (req, res) => {
   try {
-    const values = [req.user.tenantId];
-    const scopeClause = req.userScope ? 'AND domain = $2' : '';
-    if (req.userScope) values.push(req.userScope);
+    const values = [req.user.tenantId, req.userScope];
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `
@@ -266,7 +264,7 @@ router.get('/', requireTenant, async (req, res) => {
       FROM public.assets
       WHERE deleted_at IS NULL
         AND tenant_id = $1
-        ${scopeClause}
+        AND domain = $2
       ORDER BY created_at DESC;
     `,
         values,
@@ -368,7 +366,6 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
   try {
     const {
       codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
-      domain,
       currentMeter, meterKind, costCenter,
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
@@ -380,7 +377,7 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
       return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
     }
 
-    const assetDomain = req.userScope ?? domain ?? 'fleet';
+    const assetDomain = req.userScope;
     if (!['fleet', 'plant'].includes(assetDomain)) {
       return res.status(400).json({ error: 'Domínio do ativo inválido.' });
     }
