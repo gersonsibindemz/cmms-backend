@@ -360,6 +360,165 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
   }
 });
 
+router.post('/bulk', requireTenant, async (req, res, next) => {
+  const tenantId = req.user.tenantId;
+  const { userScope } = req;
+  const assets = req.body?.assets;
+
+  if (!Array.isArray(assets) || assets.length === 0 || assets.length > 100) {
+    return res.status(400).json({
+      error: 'O lote deve conter entre 1 e 100 ativos.',
+    });
+  }
+
+  try {
+    const result = await withTenantContext(tenantId, req.user.role, async (client) => {
+      const tenantResult = await client.query(
+        `SELECT max_assets_limit
+         FROM public.tenants
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [tenantId],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { tenantNotFound: true };
+
+      const countResult = await client.query(
+        `SELECT COUNT(*) AS total
+         FROM public.assets
+         WHERE tenant_id = $1::uuid
+           AND deleted_at IS NULL`,
+        [tenantId],
+      );
+      const total = Number(countResult.rows[0].total);
+      const maxAssetsLimit = Number(tenant.max_assets_limit);
+      if (total + assets.length > maxAssetsLimit) {
+        return {
+          limitExceeded: true,
+          error: `O lote excede o limite contratado. Espaço disponível: ${maxAssetsLimit - total} ativos.`,
+        };
+      }
+
+      const insertedRows = [];
+      for (const [index, item] of assets.entries()) {
+        try {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            Array.isArray(item) ||
+            typeof item.name !== 'string' ||
+            !item.name.trim() ||
+            typeof item.category !== 'string' ||
+            !item.category.trim()
+          ) {
+            throw new Error('Nome e categoria são obrigatórios.');
+          }
+
+          const codeTagValue = item.codeTag ?? item.code_tag;
+          if (
+            codeTagValue !== undefined &&
+            codeTagValue !== null &&
+            typeof codeTagValue !== 'string'
+          ) {
+            throw new Error('Código do ativo inválido.');
+          }
+          const codeTag = typeof codeTagValue === 'string' ? codeTagValue.trim() : '';
+          const currentMeter = Number(item.currentMeter || item.current_meter || 0);
+          if (!Number.isFinite(currentMeter) || currentMeter < 0) {
+            throw new Error('Leitura do contador inválida.');
+          }
+
+          for (const field of [
+            'brand', 'model', 'licensePlate', 'license_plate', 'chassisVin',
+            'chassis_vin', 'plantSector', 'plant_sector', 'voltageSpecs', 'voltage_specs',
+          ]) {
+            const value = item[field];
+            if (value !== undefined && value !== null && typeof value !== 'string') {
+              throw new Error(`Campo inválido: ${field}.`);
+            }
+          }
+          for (const field of ['manufactureYear', 'manufacture_year', 'powerKwKva', 'power_kw_kva']) {
+            const value = item[field];
+            if (value !== undefined && value !== null &&
+              typeof value !== 'number' && typeof value !== 'string') {
+              throw new Error(`Campo inválido: ${field}.`);
+            }
+          }
+
+          let finalCodeTag = codeTag;
+          if (!finalCodeTag) {
+            const codeResult = await client.query(
+              'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code',
+              [tenantId, item.category.trim()],
+            );
+            finalCodeTag = codeResult.rows[0]?.generated_code;
+            if (typeof finalCodeTag !== 'string' || !finalCodeTag) {
+              throw new Error('Não foi possível gerar o código do ativo.');
+            }
+          }
+
+          const insertResult = await client.query(
+            `INSERT INTO public.assets (
+               tenant_id, domain, operational_scope, name, code_tag, category,
+               brand, model, manufacture_year, status, meter_kind, current_meter,
+               license_plate, chassis_vin, plant_sector, power_kw_kva, voltage_specs
+             )
+             VALUES (
+               $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13, $14, $15, $16, $17
+             )
+             RETURNING *`,
+            [
+              tenantId,
+              userScope,
+              userScope,
+              item.name.trim(),
+              finalCodeTag,
+              item.category.trim(),
+              item.brand ?? null,
+              item.model ?? null,
+              item.manufactureYear ?? item.manufacture_year ?? null,
+              item.status ?? 'operational',
+              userScope === 'fleet' ? 'odometer_km' : 'hour_meter',
+              currentMeter,
+              item.licensePlate ?? item.license_plate ?? null,
+              item.chassisVin ?? item.chassis_vin ?? null,
+              item.plantSector ?? item.plant_sector ?? null,
+              item.powerKwKva ?? item.power_kw_kva ?? null,
+              item.voltageSpecs ?? item.voltage_specs ?? null,
+            ],
+          );
+          insertedRows.push(insertResult.rows[0]);
+        } catch (error) {
+          error.bulkLine = index + 1;
+          throw error;
+        }
+      }
+
+      return { assets: insertedRows };
+    });
+
+    if (result.tenantNotFound) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    if (result.limitExceeded) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res.status(201).json({
+      success: true,
+      count: result.assets.length,
+      assets: result.assets,
+    });
+  } catch (error) {
+    if (error.bulkLine) {
+      return res.status(400).json({
+        error: `Erro na linha ${error.bulkLine}: ${error.message}`,
+      });
+    }
+    return next(error);
+  }
+});
+
 // 3. CRIAR NOVO ATIVO (Com geração automática de código se não fornecido)
 router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) => {
   try {
