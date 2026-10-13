@@ -443,59 +443,65 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
 async function updateAsset(req, res) {
   try {
     const { id } = req.params;
-    const {
-      name, category, criticalityLevel, brand, model, manufactureYear,
-      costCenter, status,
-      licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
-      insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
-      plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
-      pressureTestExpiry, localSupplierName, warrantyExpiry, technicalSpecs
-    } = req.body;
+    const body = req.body ?? {};
+    const fields = [
+      ['name', 'name'],
+      ['category', 'category'],
+      ['criticalityLevel', 'criticality_level'],
+      ['brand', 'brand'],
+      ['model', 'model'],
+      ['manufactureYear', 'manufacture_year'],
+      ['costCenter', 'cost_center'],
+      ['status', 'status'],
+      ['licensePlate', 'license_plate'],
+      ['chassisVin', 'chassis_vin'],
+      ['engineNumber', 'engine_number'],
+      ['inatroInspectionExpiry', 'inatro_inspection_expiry'],
+      ['insurancePolicyNumber', 'insurance_policy_number'],
+      ['insuranceCompany', 'insurance_company'],
+      ['insuranceExpiry', 'insurance_expiry'],
+      ['fuelTankCapacityLiters', 'fuel_tank_capacity_liters'],
+      ['plantSector', 'plant_sector'],
+      ['voltageSpecs', 'voltage_specs'],
+      ['powerKwKva', 'power_kw_kva'],
+      ['innoqCalibrationExpiry', 'innoq_calibration_expiry'],
+      ['pressureTestExpiry', 'pressure_test_expiry'],
+      ['localSupplierName', 'local_supplier_name'],
+      ['warrantyExpiry', 'warranty_expiry'],
+      ['technicalSpecs', 'technical_specs'],
+    ];
 
+    const values = [];
+    const assignments = [];
+    for (const [bodyKey, column] of fields) {
+      if (!Object.hasOwn(body, bodyKey)) continue;
+      let value = body[bodyKey];
+      if (bodyKey === 'technicalSpecs' && value !== null) {
+        value = JSON.stringify(value);
+      }
+      values.push(value);
+      assignments.push(`${column} = $${values.length}`);
+    }
+    assignments.push('updated_at = NOW()');
+
+    values.push(id, req.user.tenantId);
+    const idParameter = values.length - 1;
+    const tenantParameter = values.length;
+    let scopeClause = '';
+    if (req.userScope) {
+      values.push(req.userScope);
+      scopeClause = `AND domain = $${values.length}`;
+    }
     const updateQuery = `
-      UPDATE public.assets SET
-        name = COALESCE($1, name),
-        category = COALESCE($2, category),
-        criticality_level = COALESCE($3, criticality_level),
-        brand = COALESCE($4, brand),
-        model = COALESCE($5, model),
-        manufacture_year = COALESCE($6, manufacture_year),
-        cost_center = COALESCE($7, cost_center),
-        status = COALESCE($8, status),
-        license_plate = COALESCE($9, license_plate),
-        chassis_vin = COALESCE($10, chassis_vin),
-        engine_number = COALESCE($11, engine_number),
-        inatro_inspection_expiry = COALESCE($12, inatro_inspection_expiry),
-        insurance_policy_number = COALESCE($13, insurance_policy_number),
-        insurance_company = COALESCE($14, insurance_company),
-        insurance_expiry = COALESCE($15, insurance_expiry),
-        fuel_tank_capacity_liters = COALESCE($16, fuel_tank_capacity_liters),
-        plant_sector = COALESCE($17, plant_sector),
-        voltage_specs = COALESCE($18, voltage_specs),
-        power_kw_kva = COALESCE($19, power_kw_kva),
-        innoq_calibration_expiry = COALESCE($20, innoq_calibration_expiry),
-        pressure_test_expiry = COALESCE($21, pressure_test_expiry),
-        local_supplier_name = COALESCE($22, local_supplier_name),
-        warranty_expiry = COALESCE($23, warranty_expiry),
-        technical_specs = COALESCE($24, technical_specs),
-        updated_at = NOW()
-      WHERE id = $25 AND deleted_at IS NULL AND tenant_id = $26
-        ${req.userScope ? 'AND domain = $27' : ''}
+      UPDATE public.assets
+      SET ${assignments.join(', ')}
+      WHERE id = $${idParameter}
+        AND deleted_at IS NULL
+        AND tenant_id = $${tenantParameter}
+        ${scopeClause}
       RETURNING *;
     `;
 
-    const values = [
-      name, category, criticalityLevel, brand, model, manufactureYear,
-      costCenter, status,
-      licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
-      insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
-      plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
-      pressureTestExpiry, localSupplierName, warrantyExpiry,
-      technicalSpecs ? JSON.stringify(technicalSpecs) : null,
-      id, req.user.tenantId
-    ];
-
-    if (req.userScope) values.push(req.userScope);
     const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(updateQuery, values),
     );

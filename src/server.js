@@ -38,6 +38,14 @@ app.use('/api/technicians', technicianRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/parts', partsRoutes);
 
+app.use((err, req, res, next) => {
+  console.error('[Unhandled Error]:', err);
+  if (res.headersSent) return next(err);
+  return res.status(err.status || 500).json({
+    error: err.message || 'Erro interno do servidor.',
+  });
+});
+
 const port = process.env.PORT ? Number(process.env.PORT) : 4000;
 app.listen(port, () => {
   console.log(`CMMS API listening on port ${port}`);

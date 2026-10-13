@@ -10,7 +10,7 @@ const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const ORDER_TYPES = new Set(['corrective', 'preventive', 'inspection']);
 const PRIORITIES = new Set(['low', 'medium', 'high', 'urgent']);
-const STATUSES = new Set(['open', 'in_progress', 'waiting_parts', 'blocked', 'completed', 'cancelled']);
+const STATUSES = new Set(['open', 'assigned', 'in_progress', 'waiting_parts', 'blocked', 'completed', 'cancelled']);
 
 router.use(authenticateToken, enforceDomainScope);
 
@@ -70,21 +70,24 @@ async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
   return result.rows;
 }
 
-async function assigneeExists(client, assignedTo, tenantId) {
+async function assigneeExists(client, assignedTo, tenantId, domain) {
   const result = await client.query(
     `SELECT id::text AS id
      FROM public.technicians
      WHERE id::text = $1::text
        AND tenant_id::text = $2::text
+       AND domain = $3
+       AND status = 'active'
        AND deleted_at IS NULL
      UNION
      SELECT id::text AS id
      FROM public.app_users
      WHERE id::text = $1::text
        AND tenant_id::text = $2::text
+       AND operational_scope = $3
        AND is_active = true
      LIMIT 1`,
-    [assignedTo, tenantId],
+    [assignedTo, tenantId, domain],
   );
   return result.rows.length > 0;
 }
@@ -135,6 +138,17 @@ async function saveWorkOrderParts(client, {
          WHERE id = $2 AND tenant_id = $3`,
         [existing.quantity, existing.part_id, tenantId],
       );
+      await client.query(
+        `INSERT INTO public.stock_movements (
+           tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+           movement_type, reason
+         )
+         SELECT $1, parts.id, $2, $3, $4, parts.unit_cost,
+                'in', 'Devolução por substituição da Ordem de Serviço'
+         FROM public.parts AS parts
+         WHERE parts.id = $5 AND parts.tenant_id = $1`,
+        [tenantId, workOrderId, appliedBy, Number(existing.quantity), existing.part_id],
+      );
     }
     await client.query(
       `DELETE FROM public.work_order_parts
@@ -150,6 +164,36 @@ async function saveWorkOrderParts(client, {
        )
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [tenantId, workOrderId, item.partId, item.quantity, item.unitCost, appliedBy],
+    );
+    const stockResult = await client.query(
+      `UPDATE public.parts
+       SET current_stock = current_stock - $1,
+           updated_at = NOW()
+       WHERE id = $2
+         AND tenant_id = $3
+         AND current_stock >= $1
+       RETURNING id`,
+      [item.quantity, item.partId, tenantId],
+    );
+    if (stockResult.rowCount === 0) {
+      const error = new Error('Stock insuficiente para aplicar as peças na ordem de serviço.');
+      error.code = 'INSUFFICIENT_WORK_ORDER_PART_STOCK';
+      throw error;
+    }
+    await client.query(
+      `INSERT INTO public.stock_movements (
+         tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+         movement_type, reason
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 'out', 'Consumo em Ordem de Serviço')`,
+      [
+        tenantId,
+        item.partId,
+        workOrderId,
+        appliedBy,
+        -Math.abs(item.quantity),
+        item.unitCost,
+      ],
     );
   }
 
@@ -217,13 +261,21 @@ router.get('/', requireTenant, async (req, res, next) => {
       return client.query(
         `SELECT work_orders.*,
                 to_jsonb(assets) AS asset,
+                (assets.id IS NULL AND EXISTS (
+                  SELECT 1
+                  FROM public.assets AS archived_assets
+                  WHERE archived_assets.id = work_orders.asset_id
+                    AND archived_assets.tenant_id = work_orders.tenant_id
+                    AND archived_assets.deleted_at IS NOT NULL
+                )) AS asset_deleted,
                 to_jsonb(assigned_technician) AS technician,
                 assigned_user.full_name AS assigned_to_name
          FROM public.work_orders AS work_orders
-         JOIN public.assets AS assets
+         LEFT JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
            AND assets.tenant_id = work_orders.tenant_id
            AND assets.deleted_at IS NULL
+           ${req.userScope ? 'AND assets.domain = $2' : ''}
          LEFT JOIN public.app_users AS assigned_user
            ON assigned_user.id = work_orders.assigned_to
           AND assigned_user.tenant_id = work_orders.tenant_id
@@ -261,11 +313,19 @@ router.get('/:id', requireTenant, async (req, res, next) => {
                 assets.code_tag AS asset_code_tag,
                 assets.name AS asset_name,
                 assets.category AS asset_category,
+                (assets.id IS NULL AND EXISTS (
+                  SELECT 1
+                  FROM public.assets AS archived_assets
+                  WHERE archived_assets.id = work_orders.asset_id
+                    AND archived_assets.tenant_id = work_orders.tenant_id
+                    AND archived_assets.deleted_at IS NOT NULL
+                )) AS asset_deleted,
                 assigned_user.full_name AS assigned_to_name
          FROM public.work_orders AS work_orders
-         JOIN public.assets AS assets
+         LEFT JOIN public.assets AS assets
            ON assets.id = work_orders.asset_id
           AND assets.tenant_id = work_orders.tenant_id
+          AND assets.deleted_at IS NULL
           ${req.userScope ? 'AND assets.domain = $3' : ''}
          LEFT JOIN public.app_users AS assigned_user
            ON assigned_user.id = work_orders.assigned_to
@@ -558,7 +618,7 @@ router.post('/', requireTenant, async (req, res, next) => {
       if (assetResult.rowCount === 0) return { notFound: true };
 
       if (assignedTo) {
-        if (!(await assigneeExists(client, assignedTo, req.user.tenantId))) {
+        if (!(await assigneeExists(client, assignedTo, req.user.tenantId, req.userScope))) {
           return { invalidAssignee: true };
         }
       }
@@ -623,6 +683,9 @@ router.post('/', requireTenant, async (req, res, next) => {
   } catch (error) {
     if (error.code === 'INVALID_WORK_ORDER_PART') {
       return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
+    if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+      return res.status(409).json({ message: 'Stock insuficiente para aplicar uma ou mais peças.' });
     }
     if (error.code === '23505') {
       return res.status(409).json({ message: 'Já existe uma ordem de serviço com este número.' });
@@ -731,7 +794,12 @@ async function updateWorkOrder(req, res, next) {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       if (body.assignedTo) {
-        if (!(await assigneeExists(client, body.assignedTo, req.user.tenantId))) {
+        if (!(await assigneeExists(
+          client,
+          body.assignedTo,
+          req.user.tenantId,
+          req.userScope,
+        ))) {
           return { invalidAssignee: true };
         }
       }
@@ -780,6 +848,9 @@ async function updateWorkOrder(req, res, next) {
   } catch (error) {
     if (error.code === 'INVALID_WORK_ORDER_PART') {
       return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
+    if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+      return res.status(409).json({ message: 'Stock insuficiente para aplicar uma ou mais peças.' });
     }
     return next(error);
   }
@@ -932,16 +1003,18 @@ router.post(
         }
 
         const partResult = await client.query(
-          `SELECT id, name, part_number, unit_of_measure, unit_cost
+          `SELECT id, name, part_number, unit_of_measure, unit_cost, current_stock
            FROM public.parts
            WHERE id = $1
              AND tenant_id = $2
              AND deleted_at IS NULL
-             AND domain = $3`,
+             AND domain = $3
+           FOR UPDATE`,
           [partId, req.user.tenantId, order.domain],
         );
         const part = partResult.rows[0];
         if (!part) return { invalidPart: true };
+        if (quantity > Number(part.current_stock)) return { insufficientStock: true };
 
         const appliedResult = await client.query(
           `INSERT INTO public.work_order_parts (
@@ -960,6 +1033,33 @@ router.post(
           ],
         );
         const applied = appliedResult.rows[0];
+        const stockResult = await client.query(
+          `UPDATE public.parts
+           SET current_stock = current_stock - $1,
+               updated_at = NOW()
+           WHERE id = $2 AND tenant_id = $3 AND current_stock >= $1`,
+          [quantity, part.id, req.user.tenantId],
+        );
+        if (stockResult.rowCount === 0) {
+          const error = new Error('Stock insuficiente para aplicar a peça na ordem de serviço.');
+          error.code = 'INSUFFICIENT_WORK_ORDER_PART_STOCK';
+          throw error;
+        }
+        await client.query(
+          `INSERT INTO public.stock_movements (
+             tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+             movement_type, reason
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, 'out', 'Consumo em Ordem de Serviço')`,
+          [
+            req.user.tenantId,
+            part.id,
+            order.id,
+            req.user.id,
+            -Math.abs(quantity),
+            part.unit_cost,
+          ],
+        );
         return {
           part: {
             ...applied,
@@ -979,8 +1079,14 @@ router.post(
       if (outcome.invalidPart) {
         return res.status(404).json({ message: 'Peça não encontrada neste escopo operacional.' });
       }
+      if (outcome.insufficientStock) {
+        return res.status(409).json({ message: 'Stock insuficiente para aplicar esta peça.' });
+      }
       return res.status(201).json({ part: outcome.part });
     } catch (error) {
+      if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+        return res.status(409).json({ message: 'Stock insuficiente para aplicar esta peça.' });
+      }
       return next(error);
     }
   },

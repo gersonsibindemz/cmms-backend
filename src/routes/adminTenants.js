@@ -36,14 +36,14 @@ router.get('/tenants', async (req, res, next) => {
   }
 });
 
-router.post('/tenants', async (req, res, next) => {
+export async function createTenantHandler(req, res, next) {
   const {
     tenantName,
     tradeName,
     nuit,
     province,
     maxAssetsLimit,
-    maxUsersLimit,
+    maxUsersLimit = 50,
     operationalScope = 'fleet',
     defaultOperationalScope,
     adminFullName,
@@ -53,6 +53,9 @@ router.post('/tenants', async (req, res, next) => {
   } = req.body ?? {};
   const tenantDefaultScope = defaultOperationalScope
     ?? (operationalScope === 'plant' ? 'plant' : 'fleet');
+  const adminOperationalScope = operationalScope === 'mixed'
+    ? tenantDefaultScope
+    : operationalScope;
 
   if (
     [tenantName, tradeName, nuit, province, adminFullName, adminEmail, adminPassword, adminPhone]
@@ -96,10 +99,11 @@ router.post('/tenants', async (req, res, next) => {
 
       const adminResult = await client.query(
         `INSERT INTO public.app_users (
-           tenant_id, email, password_hash, full_name, phone, role
+           tenant_id, email, password_hash, full_name, phone, role, operational_scope
          )
-         VALUES ($1::uuid, $2, $3, $4, $5, $6::public.user_role)
-         RETURNING id, tenant_id, email, full_name, phone, role, is_active`,
+         VALUES ($1::uuid, $2, $3, $4, $5, $6::public.user_role, $7)
+         RETURNING id, tenant_id, email, full_name, phone, role,
+                   operational_scope, is_active`,
         [
           tenant.id,
           adminEmail.trim().toLowerCase(),
@@ -107,6 +111,7 @@ router.post('/tenants', async (req, res, next) => {
           adminFullName.trim(),
           adminPhone.trim(),
           'tenant_admin',
+          adminOperationalScope,
         ],
       );
       return { tenant, admin: adminResult.rows[0] };
@@ -119,7 +124,9 @@ router.post('/tenants', async (req, res, next) => {
     }
     return next(error);
   }
-});
+}
+
+router.post('/tenants', createTenantHandler);
 
 router.patch('/tenants/:id/status', async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
