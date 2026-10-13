@@ -264,7 +264,7 @@ router.get('/', requireTenant, async (req, res) => {
       FROM public.assets
       WHERE deleted_at IS NULL
         AND tenant_id = $1
-        AND domain = $2
+        AND (domain = $2 OR to_jsonb(public.assets)->>'operational_scope' = $2)
       ORDER BY created_at DESC;
     `,
         values,
