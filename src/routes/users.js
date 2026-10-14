@@ -20,21 +20,45 @@ router.use(
 );
 
 router.get('/', async (req, res, next) => {
+  const tenantId = req.user?.tenantId || req.user?.tenant_id;
+  const userRole = req.user?.role;
+  const scope = req.userScope || req.user?.operational_scope;
+
+  if (!tenantId) {
+    return res.status(401).json({ error: 'Sessão inválida: tenant_id não identificado.' });
+  }
+
   try {
-    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
-      client.query(
-        `SELECT id, tenant_id, email, full_name AS name, role, operational_scope,
-                is_active, created_at
-         FROM public.app_users
-         WHERE tenant_id = $1::uuid
-           AND is_active = true
-           AND deleted_at IS NULL
-           AND operational_scope = $2
-         ORDER BY full_name ASC`,
-        [req.user.tenantId, req.userScope],
-      ),
-    );
-    return res.json({ users: result.rows });
+    let queryText = `
+      SELECT
+        id,
+        tenant_id,
+        email,
+        full_name,
+        phone,
+        role,
+        operational_scope,
+        is_active,
+        created_at,
+        last_login_at
+      FROM public.app_users
+      WHERE tenant_id = $1::uuid
+        AND is_active = true
+        AND deleted_at IS NULL
+    `;
+    const queryParams = [tenantId];
+
+    if (scope && userRole !== 'super_admin') {
+      queryParams.push(scope);
+      queryText += ` AND (operational_scope = $${queryParams.length} OR operational_scope IS NULL)`;
+    }
+
+    queryText += ' ORDER BY created_at DESC;';
+
+    const result = await withTenantContext(tenantId, userRole, async (client) => {
+      return client.query(queryText, queryParams);
+    });
+    return res.json({ success: true, data: result.rows });
   } catch (error) {
     return next(error);
   }
