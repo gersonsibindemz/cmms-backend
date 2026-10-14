@@ -27,6 +27,8 @@ router.get('/', async (req, res, next) => {
                 is_active, created_at
          FROM public.app_users
          WHERE tenant_id = $1::uuid
+           AND is_active = true
+           AND deleted_at IS NULL
            AND operational_scope = $2
          ORDER BY full_name ASC`,
         [req.user.tenantId, req.userScope],
