@@ -14,7 +14,8 @@ router.get('/tenants', async (req, res, next) => {
     const result = await withTenantContext(null, 'super_admin', (client) =>
       client.query(
         `SELECT tenants.id, tenants.name, tenants.trade_name, tenants.nuit,
-                tenants.province, tenants.is_active, tenants.max_assets_limit,
+                tenants.province, tenants.is_active, tenants.status,
+                tenants.max_assets_limit,
                 tenants.max_users_limit, tenants.operational_scope,
                 tenants.default_operational_scope,
                 (SELECT COUNT(*)::int
@@ -26,7 +27,7 @@ router.get('/tenants', async (req, res, next) => {
                  FROM public.app_users
                  WHERE tenant_id = tenants.id) AS total_users
          FROM public.tenants
-         ORDER BY tenants.name`,
+         ORDER BY tenants.created_at DESC`,
       ),
     );
 
@@ -127,6 +128,102 @@ export async function createTenantHandler(req, res, next) {
 }
 
 router.post('/tenants', createTenantHandler);
+
+router.put('/tenants/:id', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+  }
+
+  const {
+    name,
+    tradeName,
+    nuit,
+    province,
+    maxAssetsLimit,
+    maxUsersLimit,
+    operationalScope,
+    defaultOperationalScope,
+  } = req.body ?? {};
+
+  if (operationalScope != null && !OPERATIONAL_SCOPES.has(operationalScope)) {
+    return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+
+  try {
+    const result = await withTenantContext(null, 'super_admin', (client) =>
+      client.query(
+        `UPDATE public.tenants
+         SET name = COALESCE($1, name),
+             trade_name = COALESCE($2, trade_name),
+             nuit = COALESCE($3, nuit),
+             province = COALESCE($4, province),
+             max_assets_limit = COALESCE($5, max_assets_limit),
+             max_users_limit = COALESCE($6, max_users_limit),
+             operational_scope = COALESCE($7, operational_scope),
+             default_operational_scope = COALESCE($8, default_operational_scope),
+             updated_at = NOW()
+         WHERE id = $9::uuid
+         RETURNING *`,
+        [
+          name,
+          tradeName,
+          nuit,
+          province,
+          maxAssetsLimit,
+          maxUsersLimit,
+          operationalScope,
+          defaultOperationalScope,
+          req.params.id,
+        ],
+      ),
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    return res.status(200).json({ success: true, tenant: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.delete('/tenants/:id', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+  }
+
+  try {
+    const archived = await withTenantContext(null, 'super_admin', async (client) => {
+      const result = await client.query(
+        `UPDATE public.tenants
+         SET is_active = false,
+             status = 'cancelled',
+             updated_at = NOW()
+         WHERE id = $1::uuid
+         RETURNING id, name, is_active`,
+        [req.params.id],
+      );
+      if (result.rowCount === 0) return false;
+
+      await client.query(
+        `UPDATE public.app_users
+         SET is_active = false,
+             deleted_at = NOW()
+         WHERE tenant_id = $1::uuid`,
+        [req.params.id],
+      );
+      return true;
+    });
+    if (!archived) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    return res.status(200).json({
+      success: true,
+      message: 'Empresa arquivada e contratos revogados com sucesso.',
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.patch('/tenants/:id/status', async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
