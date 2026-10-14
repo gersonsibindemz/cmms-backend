@@ -1,5 +1,5 @@
 AUDITORIA TECNICA DO BACKEND CMMS
-Data da auditoria: 2026-10-13
+Data da auditoria: 2026-10-14
 Escopo: codigo-fonte e migracoes SQL versionados neste repositorio.
 
 RESUMO EXECUTIVO
@@ -445,3 +445,3425 @@ Limites da auditoria:
     nao e possivel afirmar discrepancias com payloads reais do frontend.
   - Nao foi executada bateria de testes: package.json nao define script de
     teste e a tarefa solicitada foi produzir auditoria estatica factual.
+
+4. SNAPSHOT INTEGRAL DO CÓDIGO-FONTE
+--------------------------------------
+Snapshot gerado em 2026-10-14 a partir dos ficheiros existentes no workspace.
+A árvore lista todos os ficheiros sob src/. O dump integral abaixo inclui os
+módulos essenciais pedidos e os equivalentes reais para tenants/helpers.
+O middleware solicitado como src/middleware/auth.js está implementado em
+src/middlewares/auth.js. Não existe src/routes/tenants.js: os handlers de
+tenants estão em src/routes/adminTenants.js e src/routes/superAdmin.js.
+Não foi encontrado helper separado de auditoria ou tenant; o contexto de
+tenant está em src/db.js e a validação de domínio em middlewares/auth.js.
+
+ÁRVORE ATUAL DE src/
+--------------------
+src/
+├── middlewares/
+│   └── auth.js
+├── routes/
+│   ├── adminTenants.js
+│   ├── assets.js
+│   ├── auth.js
+│   ├── fuelLogs.js
+│   ├── notifications.js
+│   ├── parts.js
+│   ├── superAdmin.js
+│   ├── technicians.js
+│   ├── users.js
+│   └── workOrders.js
+├── services/
+│   ├── notificationService.js
+│   └── storage.js
+├── db.js
+└── server.js
+
+CONTEÚDO INTEGRAL DOS MÓDULOS
+-----------------------------
+// ===== src/db.js =====
+import pg from 'pg';
+
+const { Pool } = pg;
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+export async function withTenantContext(tenantId, userRole, callback) {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      "SELECT set_config('app.current_tenant', $1, true), set_config('app.current_user_role', $2, true)",
+      [tenantId ?? '', userRole],
+    );
+
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// ===== src/server.js =====
+import 'dotenv/config';
+import express from 'express';
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import authRoutes from './routes/auth.js';
+import superAdminRoutes from './routes/superAdmin.js';
+import adminTenantRoutes from './routes/adminTenants.js';
+import userRoutes from './routes/users.js';
+import assetRoutes from './routes/assets.js';
+import fuelLogRoutes from './routes/fuelLogs.js';
+import workOrderRoutes from './routes/workOrders.js';
+import technicianRoutes from './routes/technicians.js';
+import notificationRoutes from './routes/notifications.js';
+import partsRoutes from './routes/parts.js';
+
+const app = express();
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+}));
+app.use(express.json());
+app.use(cookieParser());
+
+app.get('/health', (req, res) => {
+  return res.json({ status: 'ok' });
+});
+
+app.use('/api/auth', authRoutes);
+app.use('/api/super-admin', superAdminRoutes);
+app.use('/api/admin', adminTenantRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/assets', assetRoutes);
+app.use('/api/fuel', fuelLogRoutes);
+app.use('/api/work-orders', workOrderRoutes);
+app.use('/api/technicians', technicianRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/parts', partsRoutes);
+
+app.use((err, req, res, next) => {
+  console.error('[Unhandled Error]:', err);
+  if (res.headersSent) return next(err);
+  return res.status(err.status || 500).json({
+    error: err.message || 'Erro interno do servidor.',
+  });
+});
+
+const port = process.env.PORT ? Number(process.env.PORT) : 4000;
+app.listen(port, () => {
+  console.log(`CMMS API listening on port ${port}`);
+});
+
+// ===== src/middlewares/auth.js =====
+import jwt from 'jsonwebtoken';
+import { withTenantContext } from '../db.js';
+
+const DOMAIN_SCOPES = new Set(['fleet', 'plant']);
+const USER_ROLES = new Set([
+  'super_admin',
+  'tenant_admin',
+  'supervisor',
+  'technician',
+  'driver_operator',
+]);
+
+export function authenticateToken(req, res, next) {
+  const token = req.cookies?.auth_token;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Autenticação necessária.' });
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (!USER_ROLES.has(payload.role)) {
+      return res.status(403).json({ message: 'Token inválido ou expirado.' });
+    }
+
+    req.user = {
+      id: payload.id ?? payload.userId,
+      tenantId: payload.tenantId,
+      role: payload.role,
+      fullName: payload.fullName,
+      operational_scope: payload.operational_scope,
+    };
+    req.userScope = req.user.operational_scope || 'fleet';
+
+    return next();
+  } catch {
+    return res.status(403).json({ message: 'Token inválido ou expirado.' });
+  }
+}
+
+export function requireRole(allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !Array.isArray(allowedRoles) || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
+    }
+
+    return next();
+  };
+}
+
+export function requireRoles(...allowedRoles) {
+  return requireRole(allowedRoles);
+}
+
+export function enforceDomainScope(req, res, next) {
+  if (!USER_ROLES.has(req.user.role)) {
+    return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
+  }
+  if (req.user.role === 'super_admin') return next();
+
+  if (!req.user.tenantId) {
+    return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+  }
+  if (!DOMAIN_SCOPES.has(req.userScope)) {
+    return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
+  }
+
+  const requestedScope = req.query.domain
+    ?? req.query.operational_scope
+    ?? req.get('x-operational-scope')
+    ?? req.get('x-domain');
+  if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
+    return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+  if (requestedScope !== undefined && requestedScope !== req.userScope) {
+    return res.status(403).json({ error: 'O escopo solicitado não corresponde ao utilizador.' });
+  }
+
+  withTenantContext(req.user.tenantId, req.user.role, (client) =>
+    client.query(
+      `SELECT operational_scope, default_operational_scope
+       FROM public.tenants
+       WHERE id = $1::uuid`,
+      [req.user.tenantId],
+    ),
+  ).then((result) => {
+    const tenantScope = result.rows[0]?.operational_scope;
+    if (!tenantScope) {
+      return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
+    }
+
+    if (tenantScope !== 'mixed' && req.userScope !== tenantScope) {
+      return res.status(403).json({ error: 'O escopo do utilizador não está disponível neste tenant.' });
+    }
+    return next();
+  }).catch(next);
+}
+
+export function checkTenantLimits(limitType) {
+  if (!['assets', 'users'].includes(limitType)) {
+    throw new TypeError(`Tipo de limite desconhecido: ${limitType}`);
+  }
+
+  return async (req, res, next) => {
+    if (!req.user?.tenantId) {
+      return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+    }
+
+    try {
+      const allowed = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const tenantResult = await client.query(
+          `SELECT max_assets_limit, max_users_limit
+           FROM public.tenants
+           WHERE id = $1::uuid`,
+          [req.user.tenantId],
+        );
+        const tenant = tenantResult.rows[0];
+        if (!tenant) return false;
+
+        const countResult = limitType === 'assets'
+          ? await client.query(
+            `SELECT COUNT(*)::int AS total
+             FROM public.assets
+             WHERE tenant_id = $1::uuid
+               AND deleted_at IS NULL
+               AND status <> 'decommissioned'`,
+            [req.user.tenantId],
+          )
+          : await client.query(
+            `SELECT COUNT(*)::int AS total
+             FROM public.app_users
+             WHERE tenant_id = $1::uuid
+               AND is_active IS TRUE`,
+            [req.user.tenantId],
+          );
+        const limit = Number(limitType === 'assets'
+          ? tenant.max_assets_limit
+          : tenant.max_users_limit);
+
+        return countResult.rows[0].total < limit;
+      });
+
+      if (!allowed) {
+        const resource = limitType === 'assets' ? 'ativos' : 'utilizadores';
+        return res.status(403).json({ error: `Limite de ${resource} atingido para este tenant.` });
+      }
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  };
+}
+
+// ===== src/routes/auth.js =====
+import { Router } from 'express';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { pool } from '../db.js';
+
+const router = Router();
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// POST /api/auth/login
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  console.log('>>> [CMMS API] Tentativa de login para o email:', email);
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email e senha são obrigatórios.' });
+  }
+
+  if (!process.env.JWT_SECRET) {
+    return res.status(500).json({ error: 'JWT_SECRET não está definido nas variáveis de ambiente.' });
+  }
+
+  try {
+    // 1. Busca usuário e dados da empresa
+    const userQuery = await pool.query(
+      `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.role, u.is_active,
+              u.operational_scope,
+              t.is_active as tenant_active, t.name as tenant_name
+       FROM app_users u
+       LEFT JOIN tenants t ON t.id = u.tenant_id
+       WHERE u.email = $1`,
+      [email.toLowerCase().trim()]
+    );
+
+    const user = userQuery.rows[0];
+
+    if (!user) {
+      return res.status(401).json({ error: 'Credenciais inválidas.' });
+    }
+
+    if (!user.is_active) {
+      return res.status(403).json({ error: 'Utilizador inativo.' });
+    }
+
+    // Se não for super_admin, valida se o tenant está ativo
+    if (user.role !== 'super_admin' && !user.tenant_active) {
+      return res.status(403).json({ error: 'Empresa inativa.' });
+    }
+
+    // 2. Validação da senha criptografada via bcrypt
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Credenciais inválidas.' });
+    }
+
+    // 3. Emissão do token JWT
+    const token = jwt.sign(
+      {
+        userId: user.id,
+        tenantId: user.tenant_id,
+        role: user.role,
+        fullName: user.full_name,
+        operational_scope: user.operational_scope,
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    // 4. Grava Cookie HttpOnly
+    res.cookie('auth_token', token, {
+      httpOnly: true,
+      secure: IS_PROD,
+      sameSite: IS_PROD ? 'none' : 'lax',
+      maxAge: 8 * 60 * 60 * 1000
+    });
+
+    return res.status(200).json({
+      message: 'Login realizado com sucesso.',
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        role: user.role,
+        tenantId: user.tenant_id,
+        tenantName: user.tenant_name,
+        operational_scope: user.operational_scope,
+      }
+    });
+  } catch (error) {
+    console.error('Erro na autenticação:', error);
+    return res.status(500).json({ error: error.message || 'Erro interno no servidor.' });
+  }
+});
+
+// POST /api/auth/logout
+router.post('/logout', (req, res) => {
+  res.clearCookie('auth_token', {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: IS_PROD ? 'none' : 'lax'
+  });
+  return res.json({ message: 'Sessão encerrada com sucesso.' });
+});
+
+// GET /api/auth/me
+router.get('/me', (req, res) => {
+  const token = req.cookies?.auth_token;
+  if (!token) return res.status(401).json({ authenticated: false });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    return res.json({ authenticated: true, user: decoded });
+  } catch {
+    return res.status(401).json({ authenticated: false });
+  }
+});
+
+export default router;
+
+// ===== src/routes/users.js =====
+import { Router } from 'express';
+import bcrypt from 'bcrypt';
+import { withTenantContext } from '../db.js';
+import { authenticateToken } from '../middlewares/auth.js';
+
+const router = Router();
+const USER_ROLES = new Set(['tenant_admin', 'supervisor', 'technician', 'driver_operator']);
+const OPERATIONAL_SCOPES = new Set(['fleet', 'plant']);
+const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+router.use(authenticateToken, (req, res, next) => {
+  if (req.user?.role !== 'super_admin') {
+    return res.status(403).json({
+      error: 'Acesso restrito à equipa de administração da Avexas.',
+    });
+  }
+  return next();
+});
+
+router.get('/', async (req, res, next) => {
+  const targetTenant = req.query.tenant_id;
+  if (targetTenant !== undefined && (
+    typeof targetTenant !== 'string' || !UUID_PATTERN.test(targetTenant)
+  )) {
+    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+  }
+
+  try {
+    let queryText = `
+      SELECT u.id, u.tenant_id, t.name AS tenant_name, u.email, u.full_name,
+             u.role, u.operational_scope, u.is_active, u.created_at
+      FROM public.app_users u
+      LEFT JOIN public.tenants t ON t.id = u.tenant_id
+      WHERE u.deleted_at IS NULL
+    `;
+    const params = [];
+
+    if (targetTenant) {
+      params.push(targetTenant);
+      queryText += ` AND u.tenant_id = $${params.length}::uuid`;
+    }
+
+    queryText += ' ORDER BY u.created_at DESC;';
+
+    const result = await withTenantContext(null, 'super_admin', (client) => {
+      return client.query(queryText, params);
+    });
+    return res.json({ success: true, data: result.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/', async (req, res, next) => {
+  const {
+    tenant_id: tenantId,
+    full_name: fullName,
+    email,
+    password,
+    role,
+    operational_scope: operationalScope,
+  } = req.body ?? {};
+  if (
+    typeof tenantId !== 'string' ||
+    !UUID_PATTERN.test(tenantId) ||
+    typeof fullName !== 'string' ||
+    !fullName.trim() ||
+    fullName.trim().length > 255 ||
+    typeof email !== 'string' ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+    typeof password !== 'string' ||
+    password.length < 8 ||
+    !USER_ROLES.has(role) ||
+    !OPERATIONAL_SCOPES.has(operationalScope)
+  ) {
+    return res.status(400).json({ error: 'Dados do utilizador inválidos.' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 12);
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
+      const tenantResult = await client.query(
+        `SELECT operational_scope, max_users_limit
+         FROM public.tenants
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [tenantId],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { tenantNotFound: true };
+
+      if (
+        !OPERATIONAL_SCOPES.has(operationalScope) ||
+        (tenant.operational_scope !== 'mixed' && operationalScope !== tenant.operational_scope)
+      ) {
+        return { invalidScope: true };
+      }
+
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM public.app_users
+         WHERE tenant_id = $1::uuid
+           AND is_active IS TRUE
+           AND deleted_at IS NULL`,
+        [tenantId],
+      );
+      if (countResult.rows[0].total >= Number(tenant.max_users_limit)) {
+        return { limitReached: true };
+      }
+
+      const userResult = await client.query(
+        `INSERT INTO public.app_users (
+           tenant_id, email, password_hash, full_name, role, operational_scope
+         )
+         VALUES ($1::uuid, $2, $3, $4, $5::public.user_role, $6)
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, created_at`,
+        [tenantId, email.trim().toLowerCase(), passwordHash, fullName.trim(), role, operationalScope],
+      );
+      const user = userResult.rows[0];
+
+      if (role === 'technician') {
+        await client.query(
+          `INSERT INTO public.technicians (
+             tenant_id, user_id, name, email, domain
+           )
+           VALUES ($1::uuid, $2::uuid, $3, $4, $5)`,
+          [tenantId, user.id, fullName.trim(), email.trim().toLowerCase(), operationalScope],
+        );
+      }
+
+      return { user };
+    });
+
+    if (outcome.tenantNotFound) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    if (outcome.invalidScope) {
+      return res.status(400).json({ error: 'Escopo operacional inválido para este tenant.' });
+    }
+    if (outcome.limitReached) {
+      return res.status(403).json({ error: 'Limite de utilizadores atingido para este tenant.' });
+    }
+    return res.status(201).json({ user: outcome.user });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Já existe um utilizador com este email neste tenant.' });
+    }
+    return next(error);
+  }
+});
+
+async function updateUser(req, res, next) {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+
+  const { name, email, role, operational_scope: operationalScope, password } = req.body ?? {};
+  if (
+    typeof name !== 'string' ||
+    !name.trim() ||
+    name.trim().length > 255 ||
+    typeof email !== 'string' ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+    !USER_ROLES.has(role) ||
+    !OPERATIONAL_SCOPES.has(operationalScope) ||
+    (password !== undefined && (typeof password !== 'string' || password.length < 8))
+  ) {
+    return res.status(400).json({ error: 'Dados do utilizador inválidos.' });
+  }
+
+  try {
+    const passwordHash = password === undefined ? null : await bcrypt.hash(password, 12);
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
+      const tenantResult = await client.query(
+        `SELECT t.id, t.operational_scope
+         FROM public.app_users u
+         JOIN public.tenants t ON t.id = u.tenant_id
+         WHERE u.id = $1::uuid
+           AND u.deleted_at IS NULL`,
+        [req.params.id],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { userNotFound: true };
+      if (tenant.operational_scope !== 'mixed' && operationalScope !== tenant.operational_scope) {
+        return { invalidScope: true };
+      }
+
+      const userResult = await client.query(
+        `UPDATE public.app_users
+         SET email = $1,
+             full_name = $2,
+             role = $3::public.user_role,
+             operational_scope = $4,
+             password_hash = COALESCE($5, password_hash)
+         WHERE id = $6::uuid
+           AND deleted_at IS NULL
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, created_at`,
+        [
+          email.trim().toLowerCase(),
+          name.trim(),
+          role,
+          operationalScope,
+          passwordHash,
+          req.params.id,
+        ],
+      );
+      const user = userResult.rows[0];
+      if (!user) return { userNotFound: true };
+
+      if (role === 'technician') {
+        await client.query(
+          `INSERT INTO public.technicians (
+             tenant_id, user_id, name, email, domain
+           )
+           VALUES ($1::uuid, $2::uuid, $3, $4, $5)
+           ON CONFLICT (tenant_id, user_id) WHERE user_id IS NOT NULL
+           DO UPDATE SET name = EXCLUDED.name,
+                         email = EXCLUDED.email,
+                         domain = EXCLUDED.domain,
+                         status = 'active',
+                         deleted_at = NULL,
+                         updated_at = NOW()`,
+          [
+            tenant.id,
+            user.id,
+            name.trim(),
+            email.trim().toLowerCase(),
+            operationalScope,
+          ],
+        );
+      } else {
+        await client.query(
+          `UPDATE public.technicians
+           SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+           WHERE tenant_id = $1::uuid
+             AND user_id = $2::uuid
+             AND deleted_at IS NULL`,
+          [tenant.id, user.id],
+        );
+      }
+
+      return { user };
+    });
+
+    if (outcome.invalidScope) {
+      return res.status(400).json({ error: 'Escopo operacional inválido para este tenant.' });
+    }
+    if (outcome.userNotFound) {
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+    return res.json({ user: outcome.user });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Já existe um utilizador com este email neste tenant.' });
+    }
+    return next(error);
+  }
+}
+
+router.put('/:id', updateUser);
+router.patch('/:id', updateUser);
+
+router.delete('/:id', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
+      const result = await client.query(
+        `UPDATE public.app_users
+         SET is_active = false,
+             deleted_at = NOW()
+         WHERE id = $1::uuid
+           AND deleted_at IS NULL
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, created_at`,
+        [req.params.id],
+      );
+      const user = result.rows[0];
+      if (!user) return null;
+
+      await client.query(
+        `UPDATE public.technicians
+         SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+         WHERE tenant_id = $1::uuid
+           AND user_id = $2::uuid
+           AND deleted_at IS NULL`,
+        [user.tenant_id, user.id],
+      );
+      return user;
+    });
+
+    if (!outcome) {
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+    return res.json({ user: outcome });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.patch('/:id/toggle-status', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+  try {
+    const result = await withTenantContext(null, 'super_admin', (client) =>
+      client.query(
+        `UPDATE public.app_users
+         SET is_active = NOT is_active
+         WHERE id = $1::uuid
+           AND deleted_at IS NULL
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active`,
+        [req.params.id],
+      ),
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+    return res.json({ user: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+export default router;
+
+// ===== src/routes/assets.js =====
+// src/routes/assets.js
+import express from 'express';
+import multer from 'multer';
+import { basename } from 'node:path';
+import { withTenantContext } from '../db.js';
+import {
+  authenticateToken,
+  checkTenantLimits,
+  enforceDomainScope,
+} from '../middlewares/auth.js';
+import {
+  getSignedFileUrl,
+  removeAssetFile,
+  uploadAssetFile,
+} from '../services/storage.js';
+
+const router = express.Router();
+const emptyToNull = (value) => (typeof value === 'string' && value.trim() === '' ? null : value);
+const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
+const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+const ASSET_ID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const DOCUMENT_TYPES = new Set([
+  'tech_sheet',
+  'manual',
+  'diagram',
+  'inspection_certificate',
+  'insurance',
+  'asset_photo',
+]);
+const DOCUMENT_TYPE_LABELS = new Map([
+  ['ficha_tecnica', 'tech_sheet'],
+  ['ficha_tecnica_do_ativo', 'tech_sheet'],
+  ['manual', 'manual'],
+  ['diagrama', 'diagram'],
+  ['certificado_de_inspecao', 'inspection_certificate'],
+  ['certificado_de_vistoria', 'inspection_certificate'],
+  ['seguro', 'insurance'],
+  ['apolice', 'insurance'],
+  ['foto', 'asset_photo'],
+  ['fotografia', 'asset_photo'],
+  ['foto_do_ativo', 'asset_photo'],
+  ['fotografia_do_ativo', 'asset_photo'],
+]);
+
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_DOCUMENT_SIZE_BYTES, files: 1 },
+  fileFilter(req, file, callback) {
+    if (ALLOWED_DOCUMENT_MIME_TYPES.has(file.mimetype)) {
+      return callback(null, true);
+    }
+
+    const error = new Error('Tipo de arquivo não permitido.');
+    error.code = 'UNSUPPORTED_FILE_TYPE';
+    return callback(error);
+  },
+});
+
+router.use(authenticateToken, enforceDomainScope);
+
+function handleDocumentUpload(req, res, next) {
+  documentUpload.single('file')(req, res, (error) => {
+    if (!error) return next();
+
+    if (error instanceof multer.MulterError) {
+      const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ error: error.message });
+    }
+
+    if (error.code === 'UNSUPPORTED_FILE_TYPE') {
+      return res.status(415).json({ error: error.message });
+    }
+
+    return next(error);
+  });
+}
+
+function getSafeDocumentName(originalName) {
+  const name = basename(originalName.replaceAll('\\', '/'))
+    .replace(/[^\p{L}\p{N}._-]/gu, '_')
+    .slice(0, 200);
+
+  return name && name !== '.' && name !== '..' ? name : 'document';
+}
+
+function normalizeDocumentType(value) {
+  if (typeof value !== 'string') return null;
+
+  const normalized = value
+    .trim()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  const documentType = DOCUMENT_TYPE_LABELS.get(normalized) ?? normalized;
+
+  return DOCUMENT_TYPES.has(documentType) ? documentType : null;
+}
+
+function requireTenant(req, res, next) {
+  if (!req.user.tenantId) {
+    return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+  }
+  return next();
+}
+
+function validateAssetId(req, res, next) {
+  if (!ASSET_ID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do ativo inválido.' });
+  }
+  return next();
+}
+
+router.post('/:id/documents', requireTenant, validateAssetId, handleDocumentUpload, async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Nenhum ficheiro foi enviado. Anexe um ficheiro no campo "file".' });
+  }
+  if (req.file.size === 0) {
+    return res.status(400).json({ error: 'O ficheiro não pode estar vazio.' });
+  }
+  const documentType = normalizeDocumentType(req.body.documentType)
+    ?? normalizeDocumentType(req.body.document_type);
+  const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+  if (!documentType || !title || title.length > 255) {
+    return res.status(400).json({ error: 'Tipo de documento ou título inválido.' });
+  }
+
+  const fileName = getSafeDocumentName(req.file.originalname);
+  let uploaded = false;
+  let storagePath;
+
+  try {
+    storagePath = await uploadAssetFile(
+      req.user.tenantId,
+      req.params.id,
+      req.file.buffer,
+      fileName,
+      req.file.mimetype,
+    );
+    uploaded = true;
+
+    const scopeClause = req.userScope ? 'AND assets.domain = $10' : '';
+    const values = [
+      req.user.tenantId,
+      req.params.id,
+      documentType,
+      title,
+      storagePath,
+      fileName,
+      req.file.mimetype,
+      req.file.size,
+      req.user.id,
+    ];
+    if (req.userScope) values.push(req.userScope);
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `INSERT INTO public.asset_documents (
+           tenant_id, asset_id, document_type, title, file_url, file_name,
+           storage_path, mime_type, file_size_bytes, uploaded_by
+         )
+         SELECT $1, assets.id, $3, $4, $5, $6, $5, $7, $8, $9
+         FROM public.assets AS assets
+         WHERE assets.id = $2
+           AND assets.tenant_id = $1
+           AND assets.deleted_at IS NULL
+           ${scopeClause}
+         RETURNING id, tenant_id, asset_id, document_type, title, file_name,
+                   file_url, mime_type, file_size_bytes, uploaded_by, created_at`,
+        values,
+      ),
+    );
+
+    if (result.rows.length === 0) {
+      await removeAssetFile(storagePath);
+      uploaded = false;
+      return res.status(404).json({ error: 'Ativo não encontrado.' });
+    }
+
+    return res.status(201).json({ document: result.rows[0] });
+  } catch (error) {
+    if (uploaded && storagePath) {
+      try {
+        await removeAssetFile(storagePath);
+      } catch (cleanupError) {
+        console.error('Erro ao remover ficheiro após falha no registo:', cleanupError);
+      }
+    }
+
+    console.error('Erro ao carregar documento do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao carregar documento do ativo.' });
+  }
+});
+
+router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) => {
+  try {
+    const documents = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const values = [req.params.id, req.user.tenantId];
+      const scopeClause = req.userScope ? 'AND domain = $3' : '';
+      if (req.userScope) values.push(req.userScope);
+      const assetResult = await client.query(
+        `SELECT id
+         FROM public.assets
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${scopeClause}`,
+        values,
+      );
+
+      if (assetResult.rows.length === 0) return null;
+
+      const documentResult = await client.query(
+        `SELECT id, tenant_id, asset_id, document_type, title, file_name,
+                storage_path, mime_type, file_size_bytes, created_at
+         FROM public.asset_documents
+         WHERE asset_id = $1
+           AND tenant_id = $2
+           AND storage_path IS NOT NULL
+         ORDER BY created_at DESC`,
+        [req.params.id, req.user.tenantId],
+      );
+
+      return documentResult.rows;
+    });
+
+    if (documents === null) {
+      return res.status(404).json({ error: 'Ativo não encontrado.' });
+    }
+
+    const documentsWithUrls = await Promise.all(
+      documents.map(async ({ storage_path: storagePath, ...document }) => ({
+        ...document,
+        signed_url: await getSignedFileUrl(storagePath),
+      })),
+    );
+
+    return res.json({ documents: documentsWithUrls });
+  } catch (error) {
+    console.error('Erro ao listar documentos do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao listar documentos do ativo.' });
+  }
+});
+
+// 1. LISTAR ATIVOS (Apenas os não eliminados)
+router.get('/', requireTenant, async (req, res) => {
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `
+      SELECT 
+        id, code_tag, name, category, criticality_level, brand, model, manufacture_year, domain,
+        current_meter, meter_kind, status, cost_center,
+        license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
+        insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
+        plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
+        pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs,
+        created_at
+      FROM public.assets
+      WHERE tenant_id = $1::uuid
+        AND (domain = $2 OR operational_scope = $2)
+        AND deleted_at IS NULL
+      ORDER BY created_at DESC;
+    `,
+        [req.user.tenantId, req.userScope],
+      ),
+    );
+    res.json({ assets: result.rows });
+  } catch (error) {
+    console.error('Erro ao listar ativos:', error);
+    res.status(500).json({ error: 'Erro interno ao listar ativos' });
+  }
+});
+
+// 2. OBTER ATIVO ESPECÍFICO PELO ID
+router.get('/:id', requireTenant, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT * FROM public.assets
+         WHERE (id::text = $1 OR code_tag = $1)
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''};`,
+        req.userScope ? [id, req.user.tenantId, req.userScope] : [id, req.user.tenantId],
+      ),
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Ativo não encontrado ou sem permissão de acesso.' });
+    }
+
+    return res.json({ asset: rows[0] });
+  } catch (error) {
+    console.error('Erro ao obter ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao consultar ativo' });
+  }
+});
+
+router.patch('/:id/meter', requireTenant, async (req, res) => {
+  const { meterValue } = req.body ?? {};
+  if (typeof meterValue !== 'number' || !Number.isFinite(meterValue) || meterValue < 0) {
+    return res.status(400).json({ error: 'Valor do contador inválido.' });
+  }
+
+  try {
+    const asset = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const currentAsset = await client.query(
+        `SELECT id, current_meter
+         FROM public.assets
+         WHERE (id::text = $1 OR code_tag = $1)
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         FOR UPDATE;`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+
+      if (currentAsset.rows.length === 0) return null;
+      if (
+        currentAsset.rows[0].current_meter !== null
+        && meterValue < Number(currentAsset.rows[0].current_meter)
+      ) {
+        return { meterCannotDecrease: true };
+      }
+
+      const result = await client.query(
+        `UPDATE public.assets
+         SET current_meter = $1, updated_at = NOW()
+         WHERE id = $2
+           AND tenant_id = $3
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $4' : ''}
+         RETURNING *;`,
+        req.userScope
+          ? [meterValue, currentAsset.rows[0].id, req.user.tenantId, req.userScope]
+          : [meterValue, currentAsset.rows[0].id, req.user.tenantId],
+      );
+      return { asset: result.rows[0] };
+    });
+
+    if (asset === null) {
+      return res.status(404).json({ error: 'Ativo não encontrado ou sem permissão de acesso.' });
+    }
+    if ('meterCannotDecrease' in asset) {
+      return res.status(400).json({ error: 'O novo valor do contador não pode ser inferior à leitura atual.' });
+    }
+
+    return res.status(200).json({ asset: asset.asset, message: 'Contador atualizado com sucesso.' });
+  } catch (error) {
+    console.error('Erro ao atualizar contador do ativo:', error);
+    return res.status(500).json({ error: 'Erro interno ao atualizar contador do ativo.' });
+  }
+});
+
+router.post('/bulk', requireTenant, async (req, res, next) => {
+  const tenantId = req.user.tenantId;
+  const { userScope } = req;
+  const assets = req.body?.assets;
+
+  if (!Array.isArray(assets) || assets.length === 0 || assets.length > 100) {
+    return res.status(400).json({
+      error: 'O lote deve conter entre 1 e 100 ativos.',
+    });
+  }
+
+  try {
+    const result = await withTenantContext(tenantId, req.user.role, async (client) => {
+      const tenantResult = await client.query(
+        `SELECT max_assets_limit
+         FROM public.tenants
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [tenantId],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { tenantNotFound: true };
+
+      const countResult = await client.query(
+        `SELECT COUNT(*) AS total
+         FROM public.assets
+         WHERE tenant_id = $1::uuid
+           AND deleted_at IS NULL`,
+        [tenantId],
+      );
+      const total = Number(countResult.rows[0].total);
+      const maxAssetsLimit = Number(tenant.max_assets_limit);
+      if (total + assets.length > maxAssetsLimit) {
+        return {
+          limitExceeded: true,
+          error: `O lote excede o limite contratado. Espaço disponível: ${maxAssetsLimit - total} ativos.`,
+        };
+      }
+
+      const insertedRows = [];
+      for (const [index, item] of assets.entries()) {
+        try {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            Array.isArray(item) ||
+            typeof item.name !== 'string' ||
+            !item.name.trim() ||
+            typeof item.category !== 'string' ||
+            !item.category.trim()
+          ) {
+            throw new Error('Nome e categoria são obrigatórios.');
+          }
+
+          const codeTagValue = item.codeTag ?? item.code_tag;
+          if (
+            codeTagValue !== undefined &&
+            codeTagValue !== null &&
+            typeof codeTagValue !== 'string'
+          ) {
+            throw new Error('Código do ativo inválido.');
+          }
+          const codeTag = typeof codeTagValue === 'string' ? codeTagValue.trim() : '';
+          const currentMeter = Number(item.currentMeter || item.current_meter || 0);
+          if (!Number.isFinite(currentMeter) || currentMeter < 0) {
+            throw new Error('Leitura do contador inválida.');
+          }
+
+          for (const field of [
+            'brand', 'model', 'licensePlate', 'license_plate', 'chassisVin',
+            'chassis_vin', 'plantSector', 'plant_sector', 'voltageSpecs', 'voltage_specs',
+          ]) {
+            const value = item[field];
+            if (value !== undefined && value !== null && typeof value !== 'string') {
+              throw new Error(`Campo inválido: ${field}.`);
+            }
+          }
+          for (const field of ['manufactureYear', 'manufacture_year', 'powerKwKva', 'power_kw_kva']) {
+            const value = item[field];
+            if (value !== undefined && value !== null &&
+              typeof value !== 'number' && typeof value !== 'string') {
+              throw new Error(`Campo inválido: ${field}.`);
+            }
+          }
+
+          let finalCodeTag = codeTag;
+          if (!finalCodeTag) {
+            const codeResult = await client.query(
+              'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code',
+              [tenantId, item.category.trim()],
+            );
+            finalCodeTag = codeResult.rows[0]?.generated_code;
+            if (typeof finalCodeTag !== 'string' || !finalCodeTag) {
+              throw new Error('Não foi possível gerar o código do ativo.');
+            }
+          }
+
+          const insertResult = await client.query(
+            `INSERT INTO public.assets (
+               tenant_id, domain, operational_scope, name, code_tag, category,
+               brand, model, manufacture_year, status, meter_kind, current_meter,
+               license_plate, chassis_vin, plant_sector, power_kw_kva, voltage_specs
+             )
+             VALUES (
+               $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13, $14, $15, $16, $17
+             )
+             RETURNING *`,
+            [
+              tenantId,
+              userScope,
+              userScope,
+              item.name.trim(),
+              finalCodeTag,
+              item.category.trim(),
+              item.brand ?? null,
+              item.model ?? null,
+              item.manufactureYear ?? item.manufacture_year ?? null,
+              item.status ?? 'operational',
+              userScope === 'fleet' ? 'odometer_km' : 'hour_meter',
+              currentMeter,
+              item.licensePlate ?? item.license_plate ?? null,
+              item.chassisVin ?? item.chassis_vin ?? null,
+              item.plantSector ?? item.plant_sector ?? null,
+              item.powerKwKva ?? item.power_kw_kva ?? null,
+              item.voltageSpecs ?? item.voltage_specs ?? null,
+            ],
+          );
+          insertedRows.push(insertResult.rows[0]);
+        } catch (error) {
+          error.bulkLine = index + 1;
+          throw error;
+        }
+      }
+
+      return { assets: insertedRows };
+    });
+
+    if (result.tenantNotFound) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    if (result.limitExceeded) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res.status(201).json({
+      success: true,
+      count: result.assets.length,
+      assets: result.assets,
+    });
+  } catch (error) {
+    if (error.bulkLine) {
+      return res.status(400).json({
+        error: `Erro na linha ${error.bulkLine}: ${error.message}`,
+      });
+    }
+    return next(error);
+  }
+});
+
+// 3. CRIAR NOVO ATIVO (Com geração automática de código se não fornecido)
+router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) => {
+  try {
+    const {
+      codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
+      currentMeter, meterKind, costCenter,
+      licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
+      insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
+      plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
+      pressureTestExpiry, localSupplierName, warrantyExpiry, technicalSpecs
+    } = req.body;
+
+    if (!name || !category) {
+      return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
+    }
+
+    const assetDomain = req.userScope;
+    if (!['fleet', 'plant'].includes(assetDomain)) {
+      return res.status(400).json({ error: 'Domínio do ativo inválido.' });
+    }
+
+    let finalCodeTag = emptyToNull(codeTag);
+    if (!finalCodeTag) {
+      const codeRes = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+        client.query(
+          'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code;',
+          [req.user.tenantId, category],
+        ),
+      );
+      finalCodeTag = codeRes.rows[0].generated_code;
+    }
+
+    const insertQuery = `
+      INSERT INTO public.assets (
+        tenant_id, code_tag, name, category, criticality_level, brand, model, manufacture_year,
+        current_meter, meter_kind, cost_center,
+        license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
+        insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
+        plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
+        pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs, domain
+      ) VALUES (
+        $1, $2, $3, $4, COALESCE($5, 'B'), $6, $7, $8,
+        COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11,
+        $12, $13, $14, $15,
+        $16, $17, $18, $19,
+        $20, $21, $22, $23,
+        $24, $25, $26, COALESCE($27, '{}'::jsonb), $28
+      ) RETURNING *;
+    `;
+
+    const values = [
+      req.user.tenantId, finalCodeTag, name, category, emptyToNull(criticalityLevel),
+      emptyToNull(brand), emptyToNull(model), emptyToNull(manufactureYear),
+      emptyToNull(currentMeter) ?? 0, emptyToNull(meterKind) ?? 'odometer_km',
+      emptyToNull(costCenter), emptyToNull(licensePlate), emptyToNull(chassisVin),
+      emptyToNull(engineNumber), emptyToNull(inatroInspectionExpiry),
+      emptyToNull(insurancePolicyNumber), emptyToNull(insuranceCompany),
+      emptyToNull(insuranceExpiry), emptyToNull(fuelTankCapacityLiters),
+      emptyToNull(plantSector), emptyToNull(voltageSpecs), emptyToNull(powerKwKva),
+      emptyToNull(innoqCalibrationExpiry), emptyToNull(pressureTestExpiry),
+      emptyToNull(localSupplierName), emptyToNull(warrantyExpiry),
+      emptyToNull(technicalSpecs) ? JSON.stringify(technicalSpecs) : '{}',
+      assetDomain,
+    ];
+
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(insertQuery, values),
+    );
+    res.status(201).json({ asset: rows[0] });
+  } catch (error) {
+    console.error('Erro ao criar ativo:', error);
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Já existe um ativo com este código/matrícula nesta empresa.' });
+    }
+    res.status(500).json({ error: 'Erro interno ao cadastrar ativo' });
+  }
+});
+
+// 4. ATUALIZAR ATIVO (Edição com auditoria automática pelo trigger)
+async function updateAsset(req, res) {
+  try {
+    const { id } = req.params;
+    const body = req.body ?? {};
+    const fields = [
+      ['name', 'name'],
+      ['category', 'category'],
+      ['criticalityLevel', 'criticality_level'],
+      ['brand', 'brand'],
+      ['model', 'model'],
+      ['manufactureYear', 'manufacture_year'],
+      ['costCenter', 'cost_center'],
+      ['status', 'status'],
+      ['licensePlate', 'license_plate'],
+      ['chassisVin', 'chassis_vin'],
+      ['engineNumber', 'engine_number'],
+      ['inatroInspectionExpiry', 'inatro_inspection_expiry'],
+      ['insurancePolicyNumber', 'insurance_policy_number'],
+      ['insuranceCompany', 'insurance_company'],
+      ['insuranceExpiry', 'insurance_expiry'],
+      ['fuelTankCapacityLiters', 'fuel_tank_capacity_liters'],
+      ['plantSector', 'plant_sector'],
+      ['voltageSpecs', 'voltage_specs'],
+      ['powerKwKva', 'power_kw_kva'],
+      ['innoqCalibrationExpiry', 'innoq_calibration_expiry'],
+      ['pressureTestExpiry', 'pressure_test_expiry'],
+      ['localSupplierName', 'local_supplier_name'],
+      ['warrantyExpiry', 'warranty_expiry'],
+      ['technicalSpecs', 'technical_specs'],
+    ];
+
+    const values = [];
+    const assignments = [];
+    for (const [bodyKey, column] of fields) {
+      if (!Object.hasOwn(body, bodyKey)) continue;
+      let value = body[bodyKey];
+      if (bodyKey === 'technicalSpecs' && value !== null) {
+        value = JSON.stringify(value);
+      }
+      values.push(value);
+      assignments.push(`${column} = $${values.length}`);
+    }
+    assignments.push('updated_at = NOW()');
+
+    values.push(id, req.user.tenantId);
+    const idParameter = values.length - 1;
+    const tenantParameter = values.length;
+    let scopeClause = '';
+    if (req.userScope) {
+      values.push(req.userScope);
+      scopeClause = `AND domain = $${values.length}`;
+    }
+    const updateQuery = `
+      UPDATE public.assets
+      SET ${assignments.join(', ')}
+      WHERE id = $${idParameter}
+        AND deleted_at IS NULL
+        AND tenant_id = $${tenantParameter}
+        ${scopeClause}
+      RETURNING *;
+    `;
+
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(updateQuery, values),
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Ativo não encontrado para atualização' });
+    }
+
+    res.json({ asset: rows[0] });
+  } catch (error) {
+    console.error('Erro ao atualizar ativo:', error);
+    res.status(500).json({ error: 'Erro interno ao atualizar ativo' });
+  }
+}
+
+router.put('/:id', requireTenant, updateAsset);
+router.patch('/:id', requireTenant, updateAsset);
+
+// 5. SOFT-DELETE (Inativação com auditoria)
+router.delete('/:id', requireTenant, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const values = [id, req.user.tenantId];
+    const scopeClause = req.userScope ? 'AND domain = $3' : '';
+    if (req.userScope) values.push(req.userScope);
+    const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.assets SET deleted_at = NOW()
+         WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2 ${scopeClause}
+         RETURNING id, code_tag;`,
+        values,
+      ),
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Ativo não encontrado ou já removido' });
+    }
+
+    res.json({ message: 'Ativo arquivado com sucesso', asset: rows[0] });
+  } catch (error) {
+    console.error('Erro ao arquivar ativo:', error);
+    res.status(500).json({ error: 'Erro interno ao remover ativo' });
+  }
+});
+
+export default router;
+
+// ===== src/routes/workOrders.js =====
+import { Router } from 'express';
+import { withTenantContext } from '../db.js';
+import {
+  authenticateToken,
+  enforceDomainScope,
+  requireRoles,
+} from '../middlewares/auth.js';
+import { sendNotificationSafe } from '../services/notificationService.js';
+
+const router = Router();
+const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const ORDER_TYPES = new Set(['corrective', 'preventive', 'inspection']);
+const PRIORITIES = new Set(['low', 'medium', 'high', 'urgent']);
+const STATUSES = new Set(['open', 'assigned', 'in_progress', 'waiting_parts', 'blocked', 'completed', 'cancelled']);
+
+router.use(authenticateToken, enforceDomainScope);
+
+function requireTenant(req, res, next) {
+  if (!req.user.tenantId) {
+    return res.status(403).json({ message: 'A empresa do utilizador não está definida.' });
+  }
+  return next();
+}
+
+function isValidPartsPayload(parts) {
+  return Array.isArray(parts) && parts.every((part) => (
+    part !== null &&
+    typeof part === 'object' &&
+    typeof part.partId === 'string' &&
+    UUID_PATTERN.test(part.partId) &&
+    typeof part.quantity === 'number' &&
+    Number.isFinite(part.quantity) &&
+    part.quantity > 0
+  ));
+}
+
+function normalizePartsPayload(parts) {
+  if (!Array.isArray(parts)) return parts;
+  return parts.map((part) => {
+    if (part === null || typeof part !== 'object') return part;
+    const partId = part.partId || part.part_id || part.id;
+    const quantity = Number(part.quantity || 1);
+    return { ...part, partId, quantity };
+  });
+}
+
+function notifyLowStock(tenantId, domain, parts) {
+  for (const part of parts) {
+    void sendNotificationSafe({
+      tenantId,
+      domain,
+      targetRole: 'supervisor',
+      title: 'Alerta de Stock Mínimo',
+      message: `A peça "${part.name}" atingiu o nível crítico (${part.newStock} ${part.unitOfMeasure}).`,
+      link: '/inventory',
+    });
+  }
+}
+
+async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
+  const result = await client.query(
+    `SELECT work_order_parts.id,
+            work_order_parts.work_order_id,
+            work_order_parts.part_id,
+            parts.name,
+            parts.part_number,
+            parts.unit_of_measure,
+            work_order_parts.quantity,
+            work_order_parts.unit_cost,
+            work_order_parts.quantity * work_order_parts.unit_cost AS total_cost,
+            work_order_parts.notes,
+            work_order_parts.applied_by,
+            work_order_parts.created_at
+     FROM public.work_order_parts AS work_order_parts
+     JOIN public.parts AS parts
+       ON parts.id = work_order_parts.part_id
+      AND parts.tenant_id = work_order_parts.tenant_id
+     WHERE work_order_parts.work_order_id = $1
+       AND work_order_parts.tenant_id = $2
+       AND parts.domain = $3
+     ORDER BY work_order_parts.created_at ASC`,
+    [workOrderId, tenantId, domain],
+  );
+  return result.rows;
+}
+
+async function assigneeExists(client, assignedTo, tenantId, domain) {
+  const result = await client.query(
+    `SELECT id::text AS id
+     FROM public.technicians
+     WHERE id::text = $1::text
+       AND tenant_id::text = $2::text
+       AND domain = $3
+       AND status = 'active'
+       AND deleted_at IS NULL
+     UNION
+     SELECT id::text AS id
+     FROM public.app_users
+     WHERE id::text = $1::text
+       AND tenant_id::text = $2::text
+       AND operational_scope = $3
+       AND is_active = true
+     LIMIT 1`,
+    [assignedTo, tenantId, domain],
+  );
+  return result.rows.length > 0;
+}
+
+async function saveWorkOrderParts(client, {
+  tenantId,
+  workOrderId,
+  domain,
+  appliedBy,
+  parts,
+  replace = false,
+}) {
+  const preparedParts = [];
+  const lowStockNotifications = [];
+  for (const item of parts) {
+    const result = await client.query(
+      `SELECT id, unit_cost
+       FROM public.parts
+       WHERE id = $1
+         AND tenant_id = $2
+         AND domain = $3
+         AND deleted_at IS NULL
+       FOR UPDATE`,
+      [item.partId, tenantId, domain],
+    );
+    const part = result.rows[0];
+    if (!part) {
+      const error = new Error('Uma peça não foi encontrada neste escopo operacional.');
+      error.code = 'INVALID_WORK_ORDER_PART';
+      throw error;
+    }
+    preparedParts.push({ ...item, unitCost: part.unit_cost });
+  }
+
+  if (replace) {
+    const existingParts = await client.query(
+      `SELECT part_id, SUM(quantity) AS quantity
+       FROM public.work_order_parts
+       WHERE work_order_id = $1
+         AND tenant_id = $2
+       GROUP BY part_id`,
+      [workOrderId, tenantId],
+    );
+    for (const existing of existingParts.rows) {
+      await client.query(
+        `UPDATE public.parts
+         SET current_stock = current_stock + $1,
+             updated_at = NOW()
+         WHERE id = $2 AND tenant_id = $3`,
+        [existing.quantity, existing.part_id, tenantId],
+      );
+      await client.query(
+        `INSERT INTO public.stock_movements (
+           tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+           movement_type, reason
+         )
+         SELECT $1, parts.id, $2, $3, $4, parts.unit_cost,
+                'in', 'Devolução por substituição da Ordem de Serviço'
+         FROM public.parts AS parts
+         WHERE parts.id = $5 AND parts.tenant_id = $1`,
+        [tenantId, workOrderId, appliedBy, Number(existing.quantity), existing.part_id],
+      );
+    }
+    await client.query(
+      `DELETE FROM public.work_order_parts
+       WHERE work_order_id = $1 AND tenant_id = $2`,
+      [workOrderId, tenantId],
+    );
+  }
+
+  for (const item of preparedParts) {
+    await client.query(
+      `INSERT INTO public.work_order_parts (
+         tenant_id, work_order_id, part_id, quantity, unit_cost, applied_by
+       )
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [tenantId, workOrderId, item.partId, item.quantity, item.unitCost, appliedBy],
+    );
+    const stockResult = await client.query(
+      `UPDATE public.parts
+       SET current_stock = current_stock - $1,
+           updated_at = NOW()
+       WHERE id = $2
+         AND tenant_id = $3
+         AND current_stock >= $1
+       RETURNING id, current_stock, min_stock, name, unit_of_measure`,
+      [item.quantity, item.partId, tenantId],
+    );
+    if (stockResult.rowCount === 0) {
+      const error = new Error('Stock insuficiente para aplicar as peças na ordem de serviço.');
+      error.code = 'INSUFFICIENT_WORK_ORDER_PART_STOCK';
+      throw error;
+    }
+    const updatedPart = stockResult.rows[0];
+    if (Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)) {
+      lowStockNotifications.push({
+        name: updatedPart.name,
+        newStock: updatedPart.current_stock,
+        unitOfMeasure: updatedPart.unit_of_measure,
+      });
+    }
+    await client.query(
+      `INSERT INTO public.stock_movements (
+         tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+         movement_type, reason
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 'out', 'Consumo em Ordem de Serviço')`,
+      [
+        tenantId,
+        item.partId,
+        workOrderId,
+        appliedBy,
+        -Math.abs(item.quantity),
+        item.unitCost,
+      ],
+    );
+  }
+
+  return {
+    parts: await getWorkOrderParts(client, tenantId, workOrderId, domain),
+    lowStockNotifications,
+  };
+}
+
+router.get('/', requireTenant, async (req, res, next) => {
+  const { id: userId, role, tenantId } = req.user;
+  const filters = [];
+  const values = [tenantId, req.userScope];
+  filters.push('(assets.domain = $2 OR work_orders.domain = $2)');
+
+  for (const [queryKey, column] of [
+    ['status', 'work_orders.status'],
+    ['priority', 'work_orders.priority'],
+    ['asset_id', 'work_orders.asset_id'],
+  ]) {
+    const value = req.query[queryKey];
+    if (value === undefined || value === '') continue;
+    if (
+      typeof value !== 'string' ||
+      (queryKey === 'asset_id' && !UUID_PATTERN.test(value))
+    ) {
+      return res.status(400).json({ message: `Filtro inválido: ${queryKey}.` });
+    }
+
+    values.push(value);
+    filters.push(`${column} = $${values.length}`);
+  }
+
+  try {
+    const result = await withTenantContext(tenantId, role, async (client) => {
+      const queryFilters = [...filters];
+      const queryValues = [...values];
+
+      if (role === 'technician') {
+        const technicianResult = await client.query(
+          `SELECT id
+           FROM public.technicians
+           WHERE user_id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
+           LIMIT 1`,
+          req.userScope ? [userId, tenantId, req.userScope] : [userId, tenantId],
+        );
+        const technicianId = technicianResult.rows[0]?.id;
+        if (!technicianId) return { rows: [] };
+
+        queryValues.push(userId, technicianId);
+        queryFilters.push(
+          `(work_orders.assigned_to = $${queryValues.length - 1}
+            OR work_orders.assigned_to = $${queryValues.length}
+            OR (work_orders.assigned_to IS NULL AND work_orders.status = 'open'))`,
+        );
+      }
+
+      const whereFilters = queryFilters.length > 0
+        ? `AND ${queryFilters.join(' AND ')}`
+        : '';
+
+      return client.query(
+        `SELECT work_orders.*,
+                to_jsonb(assets) AS asset,
+                (assets.id IS NULL AND EXISTS (
+                  SELECT 1
+                  FROM public.assets AS archived_assets
+                  WHERE archived_assets.id = work_orders.asset_id
+                    AND archived_assets.tenant_id = work_orders.tenant_id
+                    AND archived_assets.deleted_at IS NOT NULL
+                )) AS asset_deleted,
+                to_jsonb(tech) AS technician,
+                usr.full_name AS assigned_to_name,
+                COALESCE(tech.name, usr.full_name, NULL) AS assigned_technician_name
+         FROM public.work_orders AS work_orders
+         INNER JOIN public.assets AS assets
+           ON assets.id = work_orders.asset_id
+           AND assets.tenant_id = work_orders.tenant_id
+           AND assets.deleted_at IS NULL
+         LEFT JOIN public.technicians AS tech
+           ON tech.id = work_orders.assigned_to
+          AND tech.tenant_id = work_orders.tenant_id
+          AND tech.deleted_at IS NULL
+          AND tech.domain = $2
+         LEFT JOIN public.app_users AS usr
+           ON usr.id = work_orders.assigned_to
+          AND usr.tenant_id = work_orders.tenant_id
+         WHERE work_orders.tenant_id = $1
+           AND work_orders.deleted_at IS NULL
+           AND (assets.domain = $2 OR work_orders.domain = $2)
+           ${whereFilters}
+         ORDER BY work_orders.created_at DESC`,
+        queryValues,
+      );
+    });
+
+    return res.json({
+      workOrders: result.rows.map((workOrder) => ({
+        ...workOrder,
+        assignedTechnicianName: workOrder.assigned_technician_name,
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/:id', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const workOrder = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const result = await client.query(
+        `SELECT work_orders.*,
+                assets.code_tag AS asset_code_tag,
+                assets.name AS asset_name,
+                assets.category AS asset_category,
+                (assets.id IS NULL AND EXISTS (
+                  SELECT 1
+                  FROM public.assets AS archived_assets
+                  WHERE archived_assets.id = work_orders.asset_id
+                    AND archived_assets.tenant_id = work_orders.tenant_id
+                    AND archived_assets.deleted_at IS NOT NULL
+                )) AS asset_deleted,
+                assigned_user.full_name AS assigned_to_name
+         FROM public.work_orders AS work_orders
+         LEFT JOIN public.assets AS assets
+           ON assets.id = work_orders.asset_id
+          AND assets.tenant_id = work_orders.tenant_id
+          AND assets.deleted_at IS NULL
+          ${req.userScope ? 'AND assets.domain = $3' : ''}
+         LEFT JOIN public.app_users AS assigned_user
+           ON assigned_user.id = work_orders.assigned_to
+          AND assigned_user.tenant_id = work_orders.tenant_id
+         WHERE work_orders.id = $1
+           AND work_orders.tenant_id = $2
+           AND work_orders.deleted_at IS NULL
+           ${req.userScope ? 'AND work_orders.domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+
+      const order = result.rows[0];
+      if (!order) return null;
+      order.parts = await getWorkOrderParts(
+        client,
+        req.user.tenantId,
+        order.id,
+        order.domain,
+      );
+      return order;
+    });
+
+    if (!workOrder) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ workOrder });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+async function handleWorkOrderTransition(req, res, next) {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  const { eventType, reason, justification, meterAtService } = req.body ?? {};
+  const transition = {
+    start: { status: 'in_progress', allowedFrom: ['open', 'assigned'] },
+    pause: { status: 'waiting_parts', allowedFrom: ['in_progress'] },
+    resume: { status: 'in_progress', allowedFrom: ['waiting_parts', 'blocked'] },
+    interrupt: { status: 'blocked', allowedFrom: ['in_progress'] },
+    complete: { status: 'completed', allowedFrom: ['in_progress', 'waiting_parts', 'blocked'] },
+  }[eventType];
+
+  if (!transition) {
+    return res.status(400).json({ message: 'Tipo de transição inválido.' });
+  }
+  if (req.user.role === 'technician' && eventType === 'interrupt') {
+    return res.status(403).json({ message: 'Técnicos não podem interromper ordens de serviço.' });
+  }
+  if (
+    (eventType === 'pause' || eventType === 'interrupt') &&
+    (typeof reason !== 'string' || !reason.trim() ||
+      typeof justification !== 'string' || !justification.trim())
+  ) {
+    return res.status(400).json({
+      message: 'Motivo e justificação são obrigatórios para pausar ou interromper a ordem de serviço.',
+    });
+  }
+  if (
+    (reason !== undefined && reason !== null && typeof reason !== 'string') ||
+    (justification !== undefined && justification !== null && typeof justification !== 'string') ||
+    (meterAtService !== undefined && meterAtService !== null && (
+      typeof meterAtService !== 'number' || !Number.isFinite(meterAtService) || meterAtService < 0
+    ))
+  ) {
+    return res.status(400).json({ message: 'Dados da transição inválidos.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id, status, assigned_to
+         FROM public.work_orders
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         FOR UPDATE`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      const order = orderResult.rows[0];
+      if (!order) return { notFound: true };
+      if (req.user.role === 'technician') {
+        const technicianResult = await client.query(
+          `SELECT id
+           FROM public.technicians
+           WHERE user_id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+           LIMIT 1`,
+          [req.user.id, req.user.tenantId],
+        );
+        const technicianId = technicianResult.rows[0]?.id;
+        if (
+          !technicianId ||
+          (order.assigned_to !== req.user.id && order.assigned_to !== technicianId)
+        ) {
+          return { forbidden: true };
+        }
+      }
+      if (!transition.allowedFrom.includes(order.status)) {
+        return { invalidTransition: true, currentStatus: order.status };
+      }
+
+      await client.query(
+        `UPDATE public.work_orders
+         SET status = $1::text::varchar,
+             started_at = CASE
+               WHEN $1::text = 'in_progress'::text AND $4::text = 'start'::text
+                 THEN COALESCE(started_at, NOW())
+               ELSE started_at
+             END,
+             completed_at = CASE
+               WHEN $1::text = 'completed'::text THEN NOW()
+               ELSE completed_at
+             END,
+             meter_at_service = COALESCE($5, meter_at_service),
+             updated_at = NOW()
+         WHERE id::text = $2::text
+           AND tenant_id::text = $3::text
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $6' : ''}`,
+        [
+          transition.status,
+          req.params.id,
+          req.user.tenantId,
+          eventType,
+          meterAtService ?? null,
+          ...(req.userScope ? [req.userScope] : []),
+        ],
+      );
+
+      await client.query(
+        `INSERT INTO public.work_order_events (
+           tenant_id, work_order_id, user_id, event_type, reason, justification, meter_at_service
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          req.user.tenantId,
+          req.params.id,
+          req.user.id,
+          eventType,
+          reason?.trim() || null,
+          justification?.trim() || null,
+          meterAtService ?? null,
+        ],
+      );
+
+      return { status: transition.status };
+    });
+
+    if (outcome.notFound) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    if (outcome.forbidden) {
+      return res.status(403).json({ message: 'Só pode executar transições em ordens atribuídas a si.' });
+    }
+    if (outcome.invalidTransition) {
+      return res.status(409).json({
+        message: `Transição não permitida a partir do estado "${outcome.currentStatus}".`,
+      });
+    }
+    return res.status(200).json({
+      message: 'Transição registada com sucesso.',
+      status: outcome.status,
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function transitionAlias(eventType) {
+  return (req, res, next) => {
+    req.body = { ...(req.body ?? {}), eventType };
+    return handleWorkOrderTransition(req, res, next);
+  };
+}
+
+router.post('/:id/transitions', requireTenant, handleWorkOrderTransition);
+router.post('/:id/start', requireTenant, transitionAlias('start'));
+router.post('/:id/pause', requireTenant, transitionAlias('pause'));
+router.post('/:id/resume', requireTenant, transitionAlias('resume'));
+
+router.get('/:id/timeline', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id
+         FROM public.work_orders
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      if (orderResult.rowCount === 0) return null;
+
+      const eventsResult = await client.query(
+        `SELECT events.*,
+                users.full_name AS user_name
+         FROM public.work_order_events AS events
+         JOIN public.work_orders AS scoped_order
+           ON scoped_order.id = events.work_order_id
+          AND scoped_order.tenant_id = events.tenant_id
+          AND scoped_order.deleted_at IS NULL
+         LEFT JOIN public.app_users AS users
+           ON users.id = events.user_id
+          AND users.tenant_id = events.tenant_id
+         WHERE events.work_order_id = $1
+           AND events.tenant_id = $2
+           ${req.userScope ? 'AND scoped_order.domain = $3' : ''}
+         ORDER BY events.created_at ASC, events.id ASC`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      return eventsResult.rows;
+    });
+
+    if (result === null) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ events: result });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/', requireTenant, async (req, res, next) => {
+  const {
+    assetId,
+    title,
+    description,
+    orderType,
+    priority,
+    assignedTo,
+    meterAtService,
+    osNumber,
+    parts,
+  } = req.body ?? {};
+  const normalizedParts = parts === undefined ? undefined : normalizePartsPayload(parts);
+
+  if (
+    typeof assetId !== 'string' ||
+    !UUID_PATTERN.test(assetId) ||
+    typeof title !== 'string' ||
+    !title.trim() ||
+    title.trim().length > 255 ||
+    (description !== undefined && description !== null && typeof description !== 'string') ||
+    !ORDER_TYPES.has(orderType) ||
+    !PRIORITIES.has(priority) ||
+    (assignedTo !== undefined && assignedTo !== null && (
+      typeof assignedTo !== 'string' || !UUID_PATTERN.test(assignedTo)
+    )) ||
+    (meterAtService !== undefined && meterAtService !== null && (
+      typeof meterAtService !== 'number' || !Number.isFinite(meterAtService) || meterAtService < 0
+    )) ||
+    (osNumber !== undefined && (
+      typeof osNumber !== 'string' || !osNumber.trim() || osNumber.trim().length > 255
+    )) ||
+    (parts !== undefined && !isValidPartsPayload(normalizedParts))
+  ) {
+    return res.status(400).json({ message: 'Dados obrigatórios da ordem de serviço inválidos.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const assetResult = await client.query(
+        `SELECT id, domain
+         FROM public.assets
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         FOR UPDATE`,
+        req.userScope
+          ? [assetId, req.user.tenantId, req.userScope]
+          : [assetId, req.user.tenantId],
+      );
+      if (assetResult.rowCount === 0) return { notFound: true };
+
+      if (assignedTo) {
+        if (!(await assigneeExists(client, assignedTo, req.user.tenantId, req.userScope))) {
+          return { invalidAssignee: true };
+        }
+      }
+
+      if (orderType === 'corrective') {
+        await client.query(
+          `UPDATE public.assets
+           SET status = 'breakdown'
+           WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+          [assetId, req.user.tenantId],
+        );
+      }
+
+      const result = await client.query(
+        `INSERT INTO public.work_orders (
+           tenant_id, os_number, asset_id, title, description, order_type,
+           priority, status, assigned_to, opened_by, meter_at_service, domain
+         )
+         VALUES (
+           $1, COALESCE($2, public.generate_work_order_number()), $3, $4, $5,
+           $6, $7, 'open', $8, $9, $10, $11
+         )
+         RETURNING *`,
+        [
+          req.user.tenantId,
+          osNumber?.trim() ?? null,
+          assetId,
+          title.trim(),
+          description ?? null,
+          orderType,
+          priority,
+          assignedTo ?? null,
+          req.user.id ?? null,
+          meterAtService ?? null,
+          assetResult.rows[0].domain,
+        ],
+      );
+
+      const workOrder = result.rows[0];
+      let lowStockNotifications = [];
+      if (normalizedParts?.length) {
+        const savedParts = await saveWorkOrderParts(client, {
+          tenantId: req.user.tenantId,
+          workOrderId: workOrder.id,
+          domain: workOrder.domain,
+          appliedBy: req.user.id,
+          parts: normalizedParts,
+        });
+        workOrder.parts = savedParts.parts;
+        lowStockNotifications = savedParts.lowStockNotifications;
+      } else {
+        workOrder.parts = [];
+      }
+      return { workOrder, lowStockNotifications };
+    });
+
+    if (outcome.notFound) {
+      return res.status(404).json({ message: 'Ativo não encontrado neste tenant.' });
+    }
+    if (outcome.invalidAssignee) {
+      return res.status(400).json({ error: 'Responsável não encontrado neste tenant.' });
+    }
+    notifyLowStock(req.user.tenantId, req.userScope, outcome.lowStockNotifications);
+    if (assignedTo) {
+      void sendNotificationSafe({
+        tenantId: req.user.tenantId,
+        domain: req.userScope,
+        userId: assignedTo,
+        title: 'Nova Ordem de Serviço Atribuída',
+        message: `Foi-lhe atribuída a ${outcome.workOrder.os_number}: ${outcome.workOrder.title}`,
+        link: '/work-orders',
+      });
+    }
+    return res.status(201).json({ workOrder: outcome.workOrder });
+  } catch (error) {
+    if (error.code === 'INVALID_WORK_ORDER_PART') {
+      return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
+    if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+      return res.status(409).json({ message: 'Stock insuficiente para aplicar uma ou mais peças.' });
+    }
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'Já existe uma ordem de serviço com este número.' });
+    }
+    return next(error);
+  }
+});
+
+async function updateWorkOrder(req, res, next) {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  const body = req.body ?? {};
+  const normalizedParts = body.parts === undefined ? undefined : normalizePartsPayload(body.parts);
+  const fields = [];
+  const values = [req.params.id, req.user.tenantId];
+  const addField = (column, value) => {
+    values.push(value);
+    fields.push(`${column} = $${values.length}`);
+  };
+
+  if (body.status !== undefined) {
+    if (!STATUSES.has(body.status)) {
+      return res.status(400).json({ message: 'Estado da ordem de serviço inválido.' });
+    }
+    addField('status', body.status);
+  }
+  if (body.priority !== undefined) {
+    if (!PRIORITIES.has(body.priority)) {
+      return res.status(400).json({ message: 'Prioridade inválida.' });
+    }
+    addField('priority', body.priority);
+  }
+  if (body.title !== undefined) {
+    if (
+      typeof body.title !== 'string' ||
+      !body.title.trim() ||
+      body.title.trim().length > 255
+    ) {
+      return res.status(400).json({ message: 'Título da ordem de serviço inválido.' });
+    }
+    addField('title', body.title.trim());
+  }
+  if (body.description !== undefined) {
+    if (body.description !== null && typeof body.description !== 'string') {
+      return res.status(400).json({ message: 'Descrição da ordem de serviço inválida.' });
+    }
+    addField('description', body.description);
+  }
+  if (body.meterAtService !== undefined) {
+    if (
+      body.meterAtService !== null &&
+      (typeof body.meterAtService !== 'number' ||
+        !Number.isFinite(body.meterAtService) ||
+        body.meterAtService < 0)
+    ) {
+      return res.status(400).json({ message: 'Leitura do contador inválida.' });
+    }
+    addField('meter_at_service', body.meterAtService);
+  }
+  if (body.assignedTo !== undefined) {
+    const assignedTo = body.assignedTo || null;
+    if (
+      assignedTo !== null
+      && (typeof assignedTo !== 'string' || !UUID_PATTERN.test(assignedTo))
+    ) {
+      return res.status(400).json({ message: 'Técnico atribuído inválido.' });
+    }
+    addField('assigned_to', assignedTo);
+  }
+  if (body.resolutionNotes !== undefined) {
+    if (body.resolutionNotes !== null && typeof body.resolutionNotes !== 'string') {
+      return res.status(400).json({ message: 'Notas de resolução inválidas.' });
+    }
+    addField('resolution_notes', body.resolutionNotes);
+  }
+  if (body.completedAt !== undefined) {
+    if (
+      body.completedAt !== null &&
+      (typeof body.completedAt !== 'string' || Number.isNaN(Date.parse(body.completedAt)))
+    ) {
+      return res.status(400).json({ message: 'Data de conclusão inválida.' });
+    }
+    if (body.completedAt === null && body.status === 'completed') {
+      fields.push('completed_at = COALESCE(completed_at, NOW())');
+    } else {
+      addField('completed_at', body.completedAt);
+    }
+  } else if (body.status === 'completed') {
+    fields.push('completed_at = COALESCE(completed_at, NOW())');
+  }
+
+  if (body.parts !== undefined && !isValidPartsPayload(normalizedParts)) {
+    return res.status(400).json({ message: 'Lista de peças inválida.' });
+  }
+  const shouldSyncParts = body.parts !== undefined;
+  if (fields.length === 0 && !shouldSyncParts) {
+    return res.status(400).json({ message: 'Nenhum campo válido foi informado para atualização.' });
+  }
+
+  if (fields.length > 0 || shouldSyncParts) fields.push('updated_at = NOW()');
+  if (req.userScope) values.push(req.userScope);
+  const scopeClause = req.userScope ? `AND domain = $${values.length}` : '';
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      if (body.assignedTo) {
+        if (!(await assigneeExists(
+          client,
+          body.assignedTo,
+          req.user.tenantId,
+          req.userScope,
+        ))) {
+          return { invalidAssignee: true };
+        }
+      }
+
+      const result = await client.query(
+        `UPDATE public.work_orders
+         SET ${fields.join(', ')}
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${scopeClause}
+         RETURNING *`,
+        values,
+      );
+      const workOrder = result.rows[0];
+      if (!workOrder) return { workOrder: null };
+
+      let lowStockNotifications = [];
+      if (shouldSyncParts) {
+        const savedParts = await saveWorkOrderParts(client, {
+          tenantId: req.user.tenantId,
+          workOrderId: workOrder.id,
+          domain: workOrder.domain,
+          appliedBy: req.user.id,
+          parts: normalizedParts,
+          replace: true,
+        });
+        workOrder.parts = savedParts.parts;
+        lowStockNotifications = savedParts.lowStockNotifications;
+      } else {
+        workOrder.parts = await getWorkOrderParts(
+          client,
+          req.user.tenantId,
+          workOrder.id,
+          workOrder.domain,
+        );
+      }
+      return { workOrder, lowStockNotifications };
+    });
+
+    if (outcome.invalidAssignee) {
+      return res.status(400).json({ error: 'Responsável não encontrado neste tenant.' });
+    }
+    if (!outcome.workOrder) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    notifyLowStock(req.user.tenantId, req.userScope, outcome.lowStockNotifications);
+    return res.json({ workOrder: outcome.workOrder });
+  } catch (error) {
+    if (error.code === 'INVALID_WORK_ORDER_PART') {
+      return res.status(400).json({ message: 'Uma ou mais peças não foram encontradas neste escopo operacional.' });
+    }
+    if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+      return res.status(409).json({ message: 'Stock insuficiente para aplicar uma ou mais peças.' });
+    }
+    return next(error);
+  }
+}
+
+router.put('/:id', requireTenant, updateWorkOrder);
+router.patch('/:id', requireTenant, updateWorkOrder);
+
+router.delete('/:id', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.work_orders
+         SET deleted_at = NOW(), updated_at = NOW()
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         RETURNING *`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      ),
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ workOrder: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/:id/parts', requireTenant, async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id
+         FROM public.work_orders
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      if (orderResult.rowCount === 0) return null;
+
+      return client.query(
+        `SELECT work_order_parts.id,
+                work_order_parts.work_order_id,
+                work_order_parts.part_id,
+                parts.name,
+                parts.part_number,
+                parts.unit_of_measure,
+                work_order_parts.quantity,
+                work_order_parts.unit_cost,
+                work_order_parts.quantity * work_order_parts.unit_cost AS total_cost,
+                work_order_parts.notes,
+                work_order_parts.applied_by,
+                work_order_parts.created_at
+         FROM public.work_order_parts AS work_order_parts
+         JOIN public.parts AS parts
+           ON parts.id = work_order_parts.part_id
+          AND parts.tenant_id = work_order_parts.tenant_id
+         WHERE work_order_parts.work_order_id = $1
+           AND work_order_parts.tenant_id = $2
+           ${req.userScope ? 'AND parts.domain = $3' : ''}
+         ORDER BY work_order_parts.created_at ASC`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+    });
+
+    if (!outcome) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    return res.json({ parts: outcome.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post(
+  '/:id/parts',
+  requireTenant,
+  requireRoles('technician', 'supervisor', 'tenant_admin'),
+  async (req, res, next) => {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
+    }
+
+    const { partId, quantity, notes } = req.body ?? {};
+    if (
+      typeof partId !== 'string' || !UUID_PATTERN.test(partId) ||
+      typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 ||
+      (notes !== undefined && notes !== null && typeof notes !== 'string')
+    ) {
+      return res.status(400).json({ message: 'Dados da peça aplicada inválidos.' });
+    }
+
+    try {
+      const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const orderResult = await client.query(
+          `SELECT id, assigned_to, domain
+           FROM public.work_orders
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
+           FOR UPDATE`,
+          req.userScope
+            ? [req.params.id, req.user.tenantId, req.userScope]
+            : [req.params.id, req.user.tenantId],
+        );
+        const order = orderResult.rows[0];
+        if (!order) return { notFound: true };
+
+        if (req.user.role === 'technician') {
+          const technicianResult = await client.query(
+            `SELECT id
+             FROM public.technicians
+             WHERE user_id = $1
+               AND tenant_id = $2
+               AND deleted_at IS NULL
+               ${req.userScope ? 'AND domain = $3' : ''}
+             LIMIT 1`,
+            req.userScope
+              ? [req.user.id, req.user.tenantId, req.userScope]
+              : [req.user.id, req.user.tenantId],
+          );
+          const technicianId = technicianResult.rows[0]?.id;
+          if (
+            !technicianId ||
+            (order.assigned_to !== req.user.id && order.assigned_to !== technicianId)
+          ) {
+            return { forbidden: true };
+          }
+        }
+
+        const partResult = await client.query(
+          `SELECT id, name, part_number, unit_of_measure, unit_cost, current_stock
+           FROM public.parts
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             AND domain = $3
+           FOR UPDATE`,
+          [partId, req.user.tenantId, order.domain],
+        );
+        const part = partResult.rows[0];
+        if (!part) return { invalidPart: true };
+        if (quantity > Number(part.current_stock)) return { insufficientStock: true };
+
+        const appliedResult = await client.query(
+          `INSERT INTO public.work_order_parts (
+             tenant_id, work_order_id, part_id, quantity, unit_cost, applied_by, notes
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *, quantity * unit_cost AS total_cost`,
+          [
+            req.user.tenantId,
+            order.id,
+            part.id,
+            quantity,
+            part.unit_cost,
+            req.user.id,
+            notes?.trim() || null,
+          ],
+        );
+        const applied = appliedResult.rows[0];
+        const stockResult = await client.query(
+          `UPDATE public.parts
+           SET current_stock = current_stock - $1,
+               updated_at = NOW()
+           WHERE id = $2 AND tenant_id = $3 AND current_stock >= $1
+           RETURNING current_stock, min_stock, name, unit_of_measure`,
+          [quantity, part.id, req.user.tenantId],
+        );
+        if (stockResult.rowCount === 0) {
+          const error = new Error('Stock insuficiente para aplicar a peça na ordem de serviço.');
+          error.code = 'INSUFFICIENT_WORK_ORDER_PART_STOCK';
+          throw error;
+        }
+        const updatedPart = stockResult.rows[0];
+        await client.query(
+          `INSERT INTO public.stock_movements (
+             tenant_id, part_id, work_order_id, user_id, quantity, unit_cost,
+             movement_type, reason
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, 'out', 'Consumo em Ordem de Serviço')`,
+          [
+            req.user.tenantId,
+            part.id,
+            order.id,
+            req.user.id,
+            -Math.abs(quantity),
+            part.unit_cost,
+          ],
+        );
+        return {
+          part: {
+            ...applied,
+            name: part.name,
+            part_number: part.part_number,
+            unit_of_measure: part.unit_of_measure,
+          },
+          lowStockNotification:
+            Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)
+              ? {
+                  name: updatedPart.name,
+                  newStock: updatedPart.current_stock,
+                  unitOfMeasure: updatedPart.unit_of_measure,
+                }
+              : null,
+        };
+      });
+
+      if (outcome.notFound) {
+        return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+      }
+      if (outcome.forbidden) {
+        return res.status(403).json({ message: 'A ordem de serviço não está atribuída a este técnico.' });
+      }
+      if (outcome.invalidPart) {
+        return res.status(404).json({ message: 'Peça não encontrada neste escopo operacional.' });
+      }
+      if (outcome.insufficientStock) {
+        return res.status(409).json({ message: 'Stock insuficiente para aplicar esta peça.' });
+      }
+      if (outcome.lowStockNotification) {
+        notifyLowStock(req.user.tenantId, req.userScope, [outcome.lowStockNotification]);
+      }
+      return res.status(201).json({ part: outcome.part });
+    } catch (error) {
+      if (error.code === 'INSUFFICIENT_WORK_ORDER_PART_STOCK') {
+        return res.status(409).json({ message: 'Stock insuficiente para aplicar esta peça.' });
+      }
+      return next(error);
+    }
+  },
+);
+
+async function closeWorkOrder(req, res, next) {
+  const body = req.body ?? {};
+  const downtimeHours = body.downtime_hours || body.downtimeHours || 0;
+  const partsCostMzn = body.parts_cost_mzn || body.partsCostMzn ||
+    body.parts_cost || body.partsCost || 0;
+  const laborCostMzn = body.labor_cost_mzn || body.laborCostMzn ||
+    body.labor_cost || body.laborCost || 0;
+  const resolutionNotes = body.resolution_notes || body.resolutionNotes || body.notes || '';
+
+  if (
+    [downtimeHours, partsCostMzn, laborCostMzn].some(
+      (value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0,
+    ) ||
+    typeof resolutionNotes !== 'string'
+  ) {
+    return res.status(400).json({
+      message: 'Horas de inatividade e custos devem ser números não negativos e as notas devem ser texto.',
+    });
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const orderResult = await client.query(
+        `SELECT id, asset_id, domain
+         FROM public.work_orders
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         FOR UPDATE`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      const order = orderResult.rows[0];
+      if (!order) return null;
+
+      const assetResult = await client.query(
+        `SELECT id FROM public.assets
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}
+         FOR UPDATE`,
+        req.userScope
+          ? [order.asset_id, req.user.tenantId, req.userScope]
+          : [order.asset_id, req.user.tenantId],
+      );
+      if (assetResult.rowCount === 0) return null;
+
+      const updatedOrder = await client.query(
+        `UPDATE public.work_orders
+         SET status = 'completed',
+             completed_at = NOW(),
+             updated_at = NOW(),
+             downtime_hours = $1,
+             parts_cost_mzn = $2,
+             labor_cost_mzn = $3,
+             parts_cost = $2,
+             labor_cost = $3,
+             total_cost = $2 + $3,
+             total_cost_mzn = $2 + $3,
+             resolution_notes = $4
+         WHERE id = $5 AND tenant_id = $6 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $7' : ''}
+         RETURNING *`,
+        req.userScope
+          ? [
+              downtimeHours,
+              partsCostMzn,
+              laborCostMzn,
+              resolutionNotes,
+              req.params.id,
+              req.user.tenantId,
+              req.userScope,
+            ]
+          : [
+              downtimeHours,
+              partsCostMzn,
+              laborCostMzn,
+              resolutionNotes,
+              req.params.id,
+              req.user.tenantId,
+            ],
+      );
+
+      await client.query(
+        `UPDATE public.assets
+         SET status = 'operational'
+         WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+           ${req.userScope ? 'AND domain = $3' : ''}`,
+        req.userScope
+          ? [order.asset_id, req.user.tenantId, req.userScope]
+          : [order.asset_id, req.user.tenantId],
+      );
+
+      return updatedOrder.rows[0];
+    });
+
+    if (!result) {
+      return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+
+    return res.json({ workOrder: result });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+router.patch(
+  '/:id/close',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  closeWorkOrder,
+);
+router.post(
+  '/:id/complete',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  closeWorkOrder,
+);
+
+export default router;
+
+// ===== src/routes/parts.js =====
+import { Router } from 'express';
+import { withTenantContext } from '../db.js';
+import {
+  authenticateToken,
+  enforceDomainScope,
+  requireRoles,
+} from '../middlewares/auth.js';
+import { sendNotificationSafe } from '../services/notificationService.js';
+
+const router = Router();
+const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+router.use(authenticateToken, enforceDomainScope);
+
+function requireTenant(req, res, next) {
+  if (!req.user.tenantId) {
+    return res.status(403).json({ message: 'A empresa do utilizador não está definida.' });
+  }
+  return next();
+}
+
+router.get('/', requireTenant, async (req, res, next) => {
+  const values = [req.user.tenantId];
+  const filters = ['tenant_id = $1', 'deleted_at IS NULL'];
+  if (req.userScope) {
+    values.push(req.userScope);
+    filters.push(`domain = $${values.length}`);
+  }
+
+  const search = req.query.search;
+  if (search !== undefined && search !== '') {
+    if (typeof search !== 'string') {
+      return res.status(400).json({ message: 'Termo de pesquisa inválido.' });
+    }
+    values.push(`%${search.trim()}%`);
+    filters.push(`(name ILIKE $${values.length}
+      OR part_number ILIKE $${values.length}
+      OR category ILIKE $${values.length})`);
+  }
+
+  if (req.query.low_stock !== undefined) {
+    if (req.query.low_stock !== 'true' && req.query.low_stock !== 'false') {
+      return res.status(400).json({ message: 'Filtro low_stock inválido.' });
+    }
+    if (req.query.low_stock === 'true') {
+      filters.push('current_stock <= min_stock');
+    }
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT *
+         FROM public.parts
+         WHERE ${filters.join(' AND ')}
+         ORDER BY name ASC`,
+        values,
+      ),
+    );
+    return res.json({ parts: result.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post(
+  '/',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  async (req, res, next) => {
+    const {
+      name,
+      partNumber,
+      part_number,
+      oem_reference,
+      category,
+      location,
+      warehouse_location,
+      unitOfMeasure,
+      unit_of_measure,
+      currentStock,
+      current_stock,
+      minStock,
+      min_stock,
+      unitCost,
+      unit_cost,
+    } = req.body ?? {};
+    const finalName = name?.trim();
+    const finalPartNumber = (partNumber || part_number || oem_reference || '').trim();
+    const finalCategory = category || 'Geral';
+    const finalLocation = location || warehouse_location || null;
+    const finalUnit = unitOfMeasure || unit_of_measure || 'un';
+    const finalStock = Number(currentStock ?? current_stock ?? 0);
+    const finalMinStock = Number(minStock ?? min_stock ?? 0);
+    const finalCost = Number(unitCost ?? unit_cost ?? 0);
+
+    if (!finalName || !finalPartNumber) {
+      return res.status(400).json({
+        error: 'Nome da peça e Referência/OEM são obrigatórios.',
+      });
+    }
+
+    try {
+      const part = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const result = await client.query(
+          `INSERT INTO public.parts (
+             tenant_id, domain, part_number, name, category, unit_of_measure,
+             location, current_stock, min_stock, unit_cost
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING *`,
+          [
+            req.user.tenantId,
+            req.userScope,
+            finalPartNumber,
+            finalName,
+            finalCategory,
+            finalUnit,
+            finalLocation,
+            finalStock,
+            finalMinStock,
+            finalCost,
+          ],
+        );
+        const createdPart = result.rows[0];
+
+        if (finalStock > 0) {
+          await client.query(
+            `INSERT INTO public.stock_movements (
+               tenant_id, part_id, user_id, movement_type, quantity, unit_cost, reason
+             )
+             VALUES ($1, $2, $3, 'in', $4, $5, 'initial_inventory')`,
+            [
+              req.user.tenantId,
+              createdPart.id,
+              req.user.id,
+              finalStock,
+              finalCost,
+            ],
+          );
+        }
+
+        return createdPart;
+      });
+      return res.status(201).json({ part });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  ['/:id/restock', '/:id/replenish'],
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  async (req, res) => {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ message: 'Identificador da peça inválido.' });
+    }
+
+    const { quantity, unitCost, notes } = req.body ?? {};
+    if (
+      typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 ||
+      typeof unitCost !== 'number' || !Number.isFinite(unitCost) || unitCost < 0 ||
+      (notes !== undefined && notes !== null && typeof notes !== 'string')
+    ) {
+      return res.status(400).json({ message: 'Dados de reposição inválidos.' });
+    }
+
+    try {
+      const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const partResult = await client.query(
+          `SELECT id, current_stock, unit_cost
+           FROM public.parts
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
+           FOR UPDATE`,
+          req.userScope
+            ? [req.params.id, req.user.tenantId, req.userScope]
+            : [req.params.id, req.user.tenantId],
+        );
+        const part = partResult.rows[0];
+        if (!part) return { notFound: true };
+
+        await client.query(
+          `UPDATE public.parts
+           SET unit_cost = (
+                 (current_stock * COALESCE(unit_cost, 0)) + ($1 * $2)
+               ) / (current_stock + $1),
+               current_stock = current_stock + $1,
+               updated_at = NOW()
+           WHERE id = $3 AND tenant_id = $4`,
+          [quantity, unitCost, part.id, req.user.tenantId],
+        );
+
+        await client.query(
+          `INSERT INTO public.stock_movements (
+             tenant_id, part_id, user_id, movement_type, quantity, unit_cost, reason, notes
+           )
+           VALUES ($1, $2, $3, 'in', $4, $5, 'restock_purchase', $6)`,
+          [
+            req.user.tenantId,
+            part.id,
+            req.user.id,
+            quantity,
+            unitCost,
+            notes?.trim() || null,
+          ],
+        );
+        return { success: true };
+      });
+
+      if (outcome.notFound) {
+        return res.status(404).json({ error: 'Peça não encontrada.' });
+      }
+      return res.status(200).json({ message: 'Entrada de stock registada com sucesso.' });
+    } catch (error) {
+      console.error('Erro ao registar entrada de stock:', error);
+      return res.status(500).json({ error: 'Não foi possível registar a entrada de stock.' });
+    }
+  },
+);
+
+router.post(
+  '/:id/withdraw',
+  requireTenant,
+  requireRoles('tenant_admin', 'supervisor'),
+  async (req, res) => {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ error: 'Identificador da peça inválido.' });
+    }
+
+    const { quantity, notes, reason } = req.body ?? {};
+    if (
+      typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 ||
+      (notes !== undefined && notes !== null && typeof notes !== 'string') ||
+      (reason !== undefined && reason !== null && typeof reason !== 'string')
+    ) {
+      return res.status(400).json({ error: 'Dados de saída inválidos.' });
+    }
+
+    try {
+      const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+        const partResult = await client.query(
+          `SELECT id, name, unit_of_measure, current_stock, min_stock, unit_cost
+           FROM public.parts
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}
+           FOR UPDATE`,
+          req.userScope
+            ? [req.params.id, req.user.tenantId, req.userScope]
+            : [req.params.id, req.user.tenantId],
+        );
+        const part = partResult.rows[0];
+        if (!part) return { notFound: true };
+        if (quantity > Number(part.current_stock)) return { insufficientStock: true };
+
+        const stockResult = await client.query(
+          `UPDATE public.parts
+           SET current_stock = current_stock - $1,
+               updated_at = NOW()
+           WHERE id = $2 AND tenant_id = $3
+           RETURNING current_stock, min_stock, name, unit_of_measure`,
+          [quantity, part.id, req.user.tenantId],
+        );
+
+        await client.query(
+          `INSERT INTO public.stock_movements (
+             tenant_id, part_id, user_id, movement_type, quantity, unit_cost, reason, notes
+           )
+           VALUES ($1, $2, $3, 'out', $4, $5, $6, $7)`,
+          [
+            req.user.tenantId,
+            part.id,
+            req.user.id,
+            -quantity,
+            part.unit_cost,
+            reason || 'manual_withdraw',
+            notes?.trim() || null,
+          ],
+        );
+        const updatedPart = stockResult.rows[0];
+        return {
+          success: true,
+          lowStockNotification:
+            Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)
+              ? {
+                  name: updatedPart.name,
+                  newStock: updatedPart.current_stock,
+                  unitOfMeasure: updatedPart.unit_of_measure,
+                }
+              : null,
+        };
+      });
+
+      if (outcome.notFound) {
+        return res.status(404).json({ error: 'Peça não encontrada.' });
+      }
+      if (outcome.insufficientStock) {
+        return res.status(400).json({ error: 'Stock insuficiente para efetuar a saída.' });
+      }
+      if (outcome.lowStockNotification) {
+        void sendNotificationSafe({
+          tenantId: req.user.tenantId,
+          domain: req.userScope,
+          targetRole: 'supervisor',
+          title: 'Alerta de Stock Mínimo',
+          message: `A peça "${outcome.lowStockNotification.name}" atingiu o nível crítico (${outcome.lowStockNotification.newStock} ${outcome.lowStockNotification.unitOfMeasure}).`,
+          link: '/inventory',
+        });
+      }
+      return res.status(200).json({ message: 'Saída de stock registada com sucesso.' });
+    } catch (error) {
+      console.error('Erro ao registar saída de stock:', error);
+      return res.status(500).json({ error: 'Não foi possível registar a saída de stock.' });
+    }
+  },
+);
+
+export default router;
+
+// ===== src/routes/notifications.js =====
+import { Router } from 'express';
+import { withTenantContext } from '../db.js';
+import {
+  authenticateToken,
+  enforceDomainScope,
+} from '../middlewares/auth.js';
+
+const router = Router();
+const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+router.use(authenticateToken, enforceDomainScope);
+
+router.get('/', async (req, res, next) => {
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT notifications.*,
+                COUNT(*) FILTER (WHERE is_read = false) OVER ()::int AS unread_count
+         FROM public.notifications AS notifications
+         WHERE tenant_id = $1::uuid
+           AND domain = $2
+           AND (user_id IS NULL OR user_id = $3::uuid)
+           AND (target_role IS NULL OR target_role = $4)
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [req.user.tenantId, req.userScope, req.user.id, req.user.role],
+      ),
+    );
+    const notifications = result.rows.map(({ unread_count: _unreadCount, ...row }) => row);
+    const unreadCount = result.rows[0]?.unread_count ?? 0;
+    return res.json({ notifications, unreadCount });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.patch('/:id/read', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador da notificação inválido.' });
+  }
+
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.notifications
+         SET is_read = true
+         WHERE id = $1::uuid
+           AND tenant_id = $2::uuid
+           AND domain = $3
+           AND (user_id = $4::uuid OR (
+             user_id IS NULL
+             AND (target_role IS NULL OR target_role = $5)
+           ))
+         RETURNING *`,
+        [req.params.id, req.user.tenantId, req.userScope, req.user.id, req.user.role],
+      ),
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Notificação não encontrada.' });
+    }
+    return res.json({ notification: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.patch('/read-all', async (req, res, next) => {
+  try {
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.notifications
+         SET is_read = true
+         WHERE tenant_id = $1::uuid
+           AND domain = $2
+           AND is_read = false
+           AND (user_id = $3::uuid OR (
+             user_id IS NULL
+             AND (target_role IS NULL OR target_role = $4)
+           ))
+         RETURNING id`,
+        [req.user.tenantId, req.userScope, req.user.id, req.user.role],
+      ),
+    );
+    return res.json({ updatedCount: result.rowCount });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+export default router;
+
+// ===== src/routes/adminTenants.js =====
+import { Router } from 'express';
+import bcrypt from 'bcrypt';
+import { withTenantContext } from '../db.js';
+import { authenticateToken, requireRole } from '../middlewares/auth.js';
+
+const router = Router();
+const OPERATIONAL_SCOPES = new Set(['fleet', 'plant', 'mixed']);
+const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+router.use(authenticateToken, requireRole(['super_admin']));
+
+router.get('/tenants', async (req, res, next) => {
+  try {
+    const result = await withTenantContext(null, 'super_admin', (client) =>
+      client.query(
+        `SELECT tenants.id, tenants.name, tenants.trade_name, tenants.nuit,
+                tenants.province, tenants.is_active, tenants.max_assets_limit,
+                tenants.max_users_limit, tenants.operational_scope,
+                tenants.default_operational_scope,
+                (SELECT COUNT(*)::int
+                 FROM public.assets
+                 WHERE tenant_id = tenants.id
+                   AND deleted_at IS NULL
+                   AND status <> 'decommissioned') AS total_assets,
+                (SELECT COUNT(*)::int
+                 FROM public.app_users
+                 WHERE tenant_id = tenants.id) AS total_users
+         FROM public.tenants
+         ORDER BY tenants.name`,
+      ),
+    );
+
+    return res.json({ tenants: result.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+export async function createTenantHandler(req, res, next) {
+  const {
+    tenantName,
+    tradeName,
+    nuit,
+    province,
+    maxAssetsLimit,
+    maxUsersLimit = 50,
+    operationalScope = 'fleet',
+    defaultOperationalScope,
+    adminFullName,
+    adminEmail,
+    adminPassword,
+    adminPhone,
+  } = req.body ?? {};
+  const tenantDefaultScope = defaultOperationalScope
+    ?? (operationalScope === 'plant' ? 'plant' : 'fleet');
+  const adminOperationalScope = operationalScope === 'mixed'
+    ? tenantDefaultScope
+    : operationalScope;
+
+  if (
+    [tenantName, tradeName, nuit, province, adminFullName, adminEmail, adminPassword, adminPhone]
+      .some((value) => typeof value !== 'string' || !value.trim()) ||
+    !Number.isInteger(maxAssetsLimit) ||
+    maxAssetsLimit < 0 ||
+    !Number.isInteger(maxUsersLimit) ||
+    maxUsersLimit < 1 ||
+    !OPERATIONAL_SCOPES.has(operationalScope) ||
+    !['fleet', 'plant'].includes(tenantDefaultScope) ||
+    (operationalScope !== 'mixed' && tenantDefaultScope !== operationalScope) ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail.trim())
+  ) {
+    return res.status(400).json({ error: 'Dados da empresa ou do administrador inválidos.' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(adminPassword, 12);
+    const result = await withTenantContext(null, 'super_admin', async (client) => {
+      const tenantResult = await client.query(
+        `INSERT INTO public.tenants (
+           name, trade_name, nuit, province, max_assets_limit, max_users_limit,
+           operational_scope, default_operational_scope
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, name, trade_name, nuit, province, is_active,
+                   max_assets_limit, max_users_limit, operational_scope,
+                   default_operational_scope`,
+        [
+          tenantName.trim(),
+          tradeName.trim(),
+          nuit.trim(),
+          province.trim(),
+          maxAssetsLimit,
+          maxUsersLimit,
+          operationalScope,
+          tenantDefaultScope,
+        ],
+      );
+      const tenant = tenantResult.rows[0];
+
+      const adminResult = await client.query(
+        `INSERT INTO public.app_users (
+           tenant_id, email, password_hash, full_name, phone, role, operational_scope
+         )
+         VALUES ($1::uuid, $2, $3, $4, $5, $6::public.user_role, $7)
+         RETURNING id, tenant_id, email, full_name, phone, role,
+                   operational_scope, is_active`,
+        [
+          tenant.id,
+          adminEmail.trim().toLowerCase(),
+          passwordHash,
+          adminFullName.trim(),
+          adminPhone.trim(),
+          'tenant_admin',
+          adminOperationalScope,
+        ],
+      );
+      return { tenant, admin: adminResult.rows[0] };
+    });
+
+    return res.status(201).json(result);
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'NUIT ou email já cadastrado.' });
+    }
+    return next(error);
+  }
+}
+
+router.post('/tenants', createTenantHandler);
+
+router.patch('/tenants/:id/status', async (req, res, next) => {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+  }
+  const requestedStatus = req.body?.is_active
+    ?? req.body?.isActive
+    ?? (req.body?.status === 'active' ? true : req.body?.status === 'suspended' ? false : undefined);
+  if (typeof requestedStatus !== 'boolean') {
+    return res.status(400).json({ error: 'O estado deve ser ativo ou suspenso.' });
+  }
+
+  try {
+    const result = await withTenantContext(null, 'super_admin', (client) =>
+      client.query(
+        `UPDATE public.tenants
+         SET is_active = $1
+         WHERE id = $2::uuid
+         RETURNING id, name, is_active`,
+        [requestedStatus, req.params.id],
+      ),
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    return res.json({ tenant: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+export default router;
+
+// ===== src/routes/superAdmin.js =====
+import { Router } from 'express';
+import { withTenantContext } from '../db.js';
+import { authenticateToken, requireRoles } from '../middlewares/auth.js';
+import { createTenantHandler } from './adminTenants.js';
+
+const router = Router();
+
+router.use(authenticateToken, requireRoles('super_admin'));
+
+router.post('/tenants', createTenantHandler);
+
+router.get('/tenants', async (req, res, next) => {
+  try {
+    const result = await withTenantContext(null, 'super_admin', (client) =>
+      client.query(
+        `SELECT
+           t.id,
+           t.name,
+           t.trade_name,
+           t.nuit,
+           t.province,
+           t.is_active,
+           t.max_assets_limit,
+           (SELECT COUNT(*)::int FROM assets AS a WHERE a.tenant_id = t.id) AS total_assets,
+           (SELECT COUNT(*)::int FROM app_users AS u WHERE u.tenant_id = t.id) AS total_users
+         FROM tenants AS t
+         ORDER BY t.name`,
+      ),
+    );
+
+    return res.json({ tenants: result.rows });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+export default router;
+
+// ===== src/services/notificationService.js =====
+import { withTenantContext } from '../db.js';
+
+export async function sendNotificationSafe({
+  tenantId,
+  domain,
+  userId = null,
+  targetRole = null,
+  title,
+  message,
+  link = null,
+}) {
+  try {
+    await withTenantContext(tenantId, 'tenant_admin', (client) =>
+      client.query(
+        `INSERT INTO public.notifications (
+           tenant_id, domain, user_id, target_role, title, message, link
+         )
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)`,
+        [tenantId, domain, userId, targetRole, title, message, link],
+      ),
+    );
+  } catch (err) {
+    console.error('[Notification Warn]:', err.message);
+  }
+}
+
+// ===== src/services/storage.js =====
+import { createClient } from '@supabase/supabase-js';
+import { randomUUID } from 'node:crypto';
+
+const BUCKET_NAME = 'asset-documents';
+const FILE_EXTENSIONS_BY_MIME_TYPE = new Map([
+  ['application/pdf', '.pdf'],
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp'],
+]);
+
+let supabaseClient;
+
+function getSupabaseClient() {
+  if (supabaseClient) return supabaseClient;
+
+  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY são obrigatórios para usar o storage.');
+  }
+
+  supabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+
+  return supabaseClient;
+}
+
+export async function uploadAssetFile(tenantId, assetId, fileBuffer, _fileName, mimeType) {
+  const fileExtension = FILE_EXTENSIONS_BY_MIME_TYPE.get(mimeType);
+  if (!fileExtension) {
+    throw new Error('Tipo MIME não permitido para o upload de documentos.');
+  }
+
+  const storagePath = `${tenantId}/${assetId}/${Date.now()}-${randomUUID()}${fileExtension}`;
+  const { error } = await getSupabaseClient()
+    .storage
+    .from(BUCKET_NAME)
+    .upload(storagePath, fileBuffer, {
+      contentType: mimeType,
+      upsert: false,
+    });
+
+  if (error) throw error;
+  return storagePath;
+}
+
+export async function getSignedFileUrl(filePath, expiresInSeconds = 3600) {
+  const { data, error } = await getSupabaseClient()
+    .storage
+    .from(BUCKET_NAME)
+    .createSignedUrl(filePath, expiresInSeconds);
+
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+export async function removeAssetFile(filePath) {
+  const { error } = await getSupabaseClient()
+    .storage
+    .from(BUCKET_NAME)
+    .remove([filePath]);
+
+  if (error) throw error;
+}

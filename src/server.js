@@ -12,6 +12,7 @@ import workOrderRoutes from './routes/workOrders.js';
 import technicianRoutes from './routes/technicians.js';
 import notificationRoutes from './routes/notifications.js';
 import partsRoutes from './routes/parts.js';
+import dashboardRoutes from './routes/dashboard.js';
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use('/api/work-orders', workOrderRoutes);
 app.use('/api/technicians', technicianRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/parts', partsRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 app.use((err, req, res, next) => {
   console.error('[Unhandled Error]:', err);
