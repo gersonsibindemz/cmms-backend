@@ -1,62 +1,49 @@
 import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import { withTenantContext } from '../db.js';
-import {
-  authenticateToken,
-  checkTenantLimits,
-  enforceDomainScope,
-  requireRole,
-} from '../middlewares/auth.js';
+import { authenticateToken } from '../middlewares/auth.js';
 
 const router = Router();
-const USER_ROLES = new Set(['supervisor', 'technician', 'driver_operator']);
+const USER_ROLES = new Set(['tenant_admin', 'supervisor', 'technician', 'driver_operator']);
 const OPERATIONAL_SCOPES = new Set(['fleet', 'plant']);
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
-router.use(
-  authenticateToken,
-  requireRole(['tenant_admin']),
-  enforceDomainScope,
-);
+router.use(authenticateToken, (req, res, next) => {
+  if (req.user?.role !== 'super_admin') {
+    return res.status(403).json({
+      error: 'Acesso restrito à equipa de administração da Avexas.',
+    });
+  }
+  return next();
+});
 
 router.get('/', async (req, res, next) => {
-  const tenantId = req.user?.tenantId || req.user?.tenant_id;
-  const userRole = req.user?.role;
-  const scope = req.userScope || req.user?.operational_scope;
-
-  if (!tenantId) {
-    return res.status(401).json({ error: 'Sessão inválida: tenant_id não identificado.' });
+  const targetTenant = req.query.tenant_id;
+  if (targetTenant !== undefined && (
+    typeof targetTenant !== 'string' || !UUID_PATTERN.test(targetTenant)
+  )) {
+    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
   }
 
   try {
     let queryText = `
-      SELECT
-        id,
-        tenant_id,
-        email,
-        full_name,
-        phone,
-        role,
-        operational_scope,
-        is_active,
-        created_at,
-        last_login_at
-      FROM public.app_users
-      WHERE tenant_id = $1::uuid
-        AND is_active = true
-        AND deleted_at IS NULL
+      SELECT u.id, u.tenant_id, t.name AS tenant_name, u.email, u.full_name,
+             u.role, u.operational_scope, u.is_active, u.created_at
+      FROM public.app_users u
+      LEFT JOIN public.tenants t ON t.id = u.tenant_id
+      WHERE u.deleted_at IS NULL
     `;
-    const queryParams = [tenantId];
+    const params = [];
 
-    if (scope && userRole !== 'super_admin') {
-      queryParams.push(scope);
-      queryText += ` AND (operational_scope = $${queryParams.length} OR operational_scope IS NULL)`;
+    if (targetTenant) {
+      params.push(targetTenant);
+      queryText += ` AND u.tenant_id = $${params.length}::uuid`;
     }
 
-    queryText += ' ORDER BY created_at DESC;';
+    queryText += ' ORDER BY u.created_at DESC;';
 
-    const result = await withTenantContext(tenantId, userRole, async (client) => {
-      return client.query(queryText, queryParams);
+    const result = await withTenantContext(null, 'super_admin', (client) => {
+      return client.query(queryText, params);
     });
     return res.json({ success: true, data: result.rows });
   } catch (error) {
@@ -64,12 +51,21 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-router.post('/', checkTenantLimits('users'), async (req, res, next) => {
-  const { name, email, password, role, operational_scope: operationalScope } = req.body ?? {};
+router.post('/', async (req, res, next) => {
+  const {
+    tenant_id: tenantId,
+    full_name: fullName,
+    email,
+    password,
+    role,
+    operational_scope: operationalScope,
+  } = req.body ?? {};
   if (
-    typeof name !== 'string' ||
-    !name.trim() ||
-    name.trim().length > 255 ||
+    typeof tenantId !== 'string' ||
+    !UUID_PATTERN.test(tenantId) ||
+    typeof fullName !== 'string' ||
+    !fullName.trim() ||
+    fullName.trim().length > 255 ||
     typeof email !== 'string' ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
     typeof password !== 'string' ||
@@ -82,24 +78,34 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
 
   try {
     const passwordHash = await bcrypt.hash(password, 12);
-    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
       const tenantResult = await client.query(
-        `SELECT operational_scope
+        `SELECT operational_scope, max_users_limit
          FROM public.tenants
-         WHERE id = $1::uuid`,
-        [req.user.tenantId],
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [tenantId],
       );
-      const tenantScope = tenantResult.rows[0]?.operational_scope;
-      if (!tenantScope) return { tenantNotFound: true };
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { tenantNotFound: true };
 
-      const userScope = operationalScope;
       if (
-        !userScope ||
-        !OPERATIONAL_SCOPES.has(userScope) ||
-        userScope !== req.userScope ||
-        (tenantScope !== 'mixed' && userScope !== tenantScope)
+        !OPERATIONAL_SCOPES.has(operationalScope) ||
+        (tenant.operational_scope !== 'mixed' && operationalScope !== tenant.operational_scope)
       ) {
         return { invalidScope: true };
+      }
+
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM public.app_users
+         WHERE tenant_id = $1::uuid
+           AND is_active IS TRUE
+           AND deleted_at IS NULL`,
+        [tenantId],
+      );
+      if (countResult.rows[0].total >= Number(tenant.max_users_limit)) {
+        return { limitReached: true };
       }
 
       const userResult = await client.query(
@@ -109,14 +115,7 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
          VALUES ($1::uuid, $2, $3, $4, $5::public.user_role, $6)
          RETURNING id, tenant_id, email, full_name AS name, role,
                    operational_scope, is_active, created_at`,
-        [
-          req.user.tenantId,
-          email.trim().toLowerCase(),
-          passwordHash,
-          name.trim(),
-          role,
-          userScope,
-        ],
+        [tenantId, email.trim().toLowerCase(), passwordHash, fullName.trim(), role, operationalScope],
       );
       const user = userResult.rows[0];
 
@@ -126,7 +125,7 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
              tenant_id, user_id, name, email, domain
            )
            VALUES ($1::uuid, $2::uuid, $3, $4, $5)`,
-          [req.user.tenantId, user.id, name.trim(), email.trim().toLowerCase(), userScope],
+          [tenantId, user.id, fullName.trim(), email.trim().toLowerCase(), operationalScope],
         );
       }
 
@@ -138,6 +137,9 @@ router.post('/', checkTenantLimits('users'), async (req, res, next) => {
     }
     if (outcome.invalidScope) {
       return res.status(400).json({ error: 'Escopo operacional inválido para este tenant.' });
+    }
+    if (outcome.limitReached) {
+      return res.status(403).json({ error: 'Limite de utilizadores atingido para este tenant.' });
     }
     return res.status(201).json({ user: outcome.user });
   } catch (error) {
@@ -153,13 +155,7 @@ async function updateUser(req, res, next) {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
   }
 
-  const {
-    name,
-    email,
-    role,
-    operational_scope: operationalScope,
-    password,
-  } = req.body ?? {};
+  const { name, email, role, operational_scope: operationalScope, password } = req.body ?? {};
   if (
     typeof name !== 'string' ||
     !name.trim() ||
@@ -168,7 +164,6 @@ async function updateUser(req, res, next) {
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
     !USER_ROLES.has(role) ||
     !OPERATIONAL_SCOPES.has(operationalScope) ||
-    operationalScope !== req.userScope ||
     (password !== undefined && (typeof password !== 'string' || password.length < 8))
   ) {
     return res.status(400).json({ error: 'Dados do utilizador inválidos.' });
@@ -176,16 +171,18 @@ async function updateUser(req, res, next) {
 
   try {
     const passwordHash = password === undefined ? null : await bcrypt.hash(password, 12);
-    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
       const tenantResult = await client.query(
-        `SELECT operational_scope
-         FROM public.tenants
-         WHERE id = $1::uuid`,
-        [req.user.tenantId],
+        `SELECT t.id, t.operational_scope
+         FROM public.app_users u
+         JOIN public.tenants t ON t.id = u.tenant_id
+         WHERE u.id = $1::uuid
+           AND u.deleted_at IS NULL`,
+        [req.params.id],
       );
-      const tenantScope = tenantResult.rows[0]?.operational_scope;
-      if (!tenantScope) return { tenantNotFound: true };
-      if (tenantScope !== 'mixed' && operationalScope !== tenantScope) {
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { userNotFound: true };
+      if (tenant.operational_scope !== 'mixed' && operationalScope !== tenant.operational_scope) {
         return { invalidScope: true };
       }
 
@@ -197,8 +194,7 @@ async function updateUser(req, res, next) {
              operational_scope = $4,
              password_hash = COALESCE($5, password_hash)
          WHERE id = $6::uuid
-           AND tenant_id = $7::uuid
-           AND operational_scope = $8
+           AND deleted_at IS NULL
          RETURNING id, tenant_id, email, full_name AS name, role,
                    operational_scope, is_active, created_at`,
         [
@@ -208,8 +204,6 @@ async function updateUser(req, res, next) {
           operationalScope,
           passwordHash,
           req.params.id,
-          req.user.tenantId,
-          req.userScope,
         ],
       );
       const user = userResult.rows[0];
@@ -229,7 +223,7 @@ async function updateUser(req, res, next) {
                          deleted_at = NULL,
                          updated_at = NOW()`,
           [
-            req.user.tenantId,
+            tenant.id,
             user.id,
             name.trim(),
             email.trim().toLowerCase(),
@@ -243,21 +237,18 @@ async function updateUser(req, res, next) {
            WHERE tenant_id = $1::uuid
              AND user_id = $2::uuid
              AND deleted_at IS NULL`,
-          [req.user.tenantId, user.id],
+          [tenant.id, user.id],
         );
       }
 
       return { user };
     });
 
-    if (outcome.tenantNotFound) {
-      return res.status(404).json({ error: 'Tenant não encontrado.' });
-    }
     if (outcome.invalidScope) {
       return res.status(400).json({ error: 'Escopo operacional inválido para este tenant.' });
     }
     if (outcome.userNotFound) {
-      return res.status(404).json({ error: 'Utilizador não encontrado neste escopo.' });
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
     return res.json({ user: outcome.user });
   } catch (error) {
@@ -277,16 +268,16 @@ router.delete('/:id', async (req, res, next) => {
   }
 
   try {
-    const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
       const result = await client.query(
         `UPDATE public.app_users
-         SET is_active = false
+         SET is_active = false,
+             deleted_at = NOW()
          WHERE id = $1::uuid
-           AND tenant_id = $2::uuid
-           AND operational_scope = $3
+           AND deleted_at IS NULL
          RETURNING id, tenant_id, email, full_name AS name, role,
                    operational_scope, is_active, created_at`,
-        [req.params.id, req.user.tenantId, req.userScope],
+        [req.params.id],
       );
       const user = result.rows[0];
       if (!user) return null;
@@ -297,13 +288,13 @@ router.delete('/:id', async (req, res, next) => {
          WHERE tenant_id = $1::uuid
            AND user_id = $2::uuid
            AND deleted_at IS NULL`,
-        [req.user.tenantId, user.id],
+        [user.tenant_id, user.id],
       );
       return user;
     });
 
     if (!outcome) {
-      return res.status(404).json({ error: 'Utilizador não encontrado neste tenant.' });
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
     return res.json({ user: outcome });
   } catch (error) {
@@ -316,20 +307,19 @@ router.patch('/:id/toggle-status', async (req, res, next) => {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
   }
   try {
-    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+    const result = await withTenantContext(null, 'super_admin', (client) =>
       client.query(
         `UPDATE public.app_users
          SET is_active = NOT is_active
          WHERE id = $1::uuid
-           AND tenant_id = $2::uuid
-           AND operational_scope = $3
+           AND deleted_at IS NULL
          RETURNING id, tenant_id, email, full_name AS name, role,
                    operational_scope, is_active`,
-        [req.params.id, req.user.tenantId, req.userScope],
+        [req.params.id],
       ),
     );
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Utilizador não encontrado neste tenant.' });
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
     return res.json({ user: result.rows[0] });
   } catch (error) {
