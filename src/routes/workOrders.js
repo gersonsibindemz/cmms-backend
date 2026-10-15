@@ -5,7 +5,11 @@ import {
   enforceDomainScope,
   requireRoles,
 } from '../middlewares/auth.js';
-import { sendNotificationSafe } from '../services/notificationService.js';
+import {
+  notifyCriticalWorkOrder,
+  notifyLowStock,
+  notifyWorkOrderAssigned,
+} from '../services/notificationService.js';
 
 const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
@@ -42,19 +46,6 @@ function normalizePartsPayload(parts) {
     const quantity = Number(part.quantity || 1);
     return { ...part, partId, quantity };
   });
-}
-
-function notifyLowStock(tenantId, domain, parts) {
-  for (const part of parts) {
-    void sendNotificationSafe({
-      tenantId,
-      domain,
-      targetRole: 'supervisor',
-      title: 'Alerta de Stock Mínimo',
-      message: `A peça "${part.name}" atingiu o nível crítico (${part.newStock} ${part.unitOfMeasure}).`,
-      link: '/inventory',
-    });
-  }
 }
 
 async function getWorkOrderParts(client, tenantId, workOrderId, domain) {
@@ -106,6 +97,29 @@ async function assigneeExists(client, assignedTo, tenantId, domain) {
   return result.rows.length > 0;
 }
 
+async function getTechnicianUserId(client, assignedTo, tenantId, domain) {
+  const result = await client.query(
+    `SELECT app_users.id
+     FROM public.app_users
+     WHERE app_users.id = $1
+       AND app_users.tenant_id = $2
+       AND app_users.operational_scope = $3
+       AND app_users.is_active = true
+     UNION
+     SELECT technicians.user_id AS id
+     FROM public.technicians
+     WHERE technicians.id = $1
+       AND technicians.tenant_id = $2
+       AND technicians.domain = $3
+       AND technicians.status = 'active'
+       AND technicians.deleted_at IS NULL
+       AND technicians.user_id IS NOT NULL
+     LIMIT 1`,
+    [assignedTo, tenantId, domain],
+  );
+  return result.rows[0]?.id ?? null;
+}
+
 async function saveWorkOrderParts(client, {
   tenantId,
   workOrderId,
@@ -115,7 +129,6 @@ async function saveWorkOrderParts(client, {
   replace = false,
 }) {
   const preparedParts = [];
-  const lowStockNotifications = [];
   for (const item of parts) {
     const result = await client.query(
       `SELECT id, unit_cost
@@ -187,7 +200,7 @@ async function saveWorkOrderParts(client, {
        WHERE id = $2
          AND tenant_id = $3
          AND current_stock >= $1
-       RETURNING id, current_stock, min_stock, name, unit_of_measure`,
+       RETURNING id, current_stock, min_stock, name, part_number, unit_of_measure`,
       [item.quantity, item.partId, tenantId],
     );
     if (stockResult.rowCount === 0) {
@@ -197,11 +210,11 @@ async function saveWorkOrderParts(client, {
     }
     const updatedPart = stockResult.rows[0];
     if (Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)) {
-      lowStockNotifications.push({
-        name: updatedPart.name,
-        newStock: updatedPart.current_stock,
-        unitOfMeasure: updatedPart.unit_of_measure,
-      });
+      await notifyLowStock({
+        ...updatedPart,
+        tenant_id: tenantId,
+        domain,
+      }, client);
     }
     await client.query(
       `INSERT INTO public.stock_movements (
@@ -222,7 +235,6 @@ async function saveWorkOrderParts(client, {
 
   return {
     parts: await getWorkOrderParts(client, tenantId, workOrderId, domain),
-    lowStockNotifications,
   };
 }
 
@@ -630,7 +642,7 @@ router.post('/', requireTenant, async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const assetResult = await client.query(
-        `SELECT id, domain
+        `SELECT id, domain, name
          FROM public.assets
          WHERE id = $1
            AND tenant_id = $2
@@ -684,7 +696,6 @@ router.post('/', requireTenant, async (req, res, next) => {
       );
 
       const workOrder = result.rows[0];
-      let lowStockNotifications = [];
       if (normalizedParts?.length) {
         const savedParts = await saveWorkOrderParts(client, {
           tenantId: req.user.tenantId,
@@ -694,11 +705,28 @@ router.post('/', requireTenant, async (req, res, next) => {
           parts: normalizedParts,
         });
         workOrder.parts = savedParts.parts;
-        lowStockNotifications = savedParts.lowStockNotifications;
       } else {
         workOrder.parts = [];
       }
-      return { workOrder, lowStockNotifications };
+
+      if (assignedTo) {
+        const technicianUserId = await getTechnicianUserId(
+          client,
+          assignedTo,
+          req.user.tenantId,
+          workOrder.domain,
+        );
+        if (technicianUserId) {
+          await notifyWorkOrderAssigned(
+            workOrder,
+            technicianUserId,
+            assetResult.rows[0],
+            client,
+          );
+        }
+      }
+      await notifyCriticalWorkOrder(workOrder, assetResult.rows[0], client);
+      return { workOrder };
     });
 
     if (outcome.notFound) {
@@ -706,17 +734,6 @@ router.post('/', requireTenant, async (req, res, next) => {
     }
     if (outcome.invalidAssignee) {
       return res.status(400).json({ error: 'Responsável não encontrado neste tenant.' });
-    }
-    notifyLowStock(req.user.tenantId, req.userScope, outcome.lowStockNotifications);
-    if (assignedTo) {
-      void sendNotificationSafe({
-        tenantId: req.user.tenantId,
-        domain: req.userScope,
-        userId: assignedTo,
-        title: 'Nova Ordem de Serviço Atribuída',
-        message: `Foi-lhe atribuída a ${outcome.workOrder.os_number}: ${outcome.workOrder.title}`,
-        link: '/work-orders',
-      });
     }
     return res.status(201).json({ workOrder: outcome.workOrder });
   } catch (error) {
@@ -829,9 +846,25 @@ async function updateWorkOrder(req, res, next) {
   if (fields.length > 0 || shouldSyncParts) fields.push('updated_at = NOW()');
   if (req.userScope) values.push(req.userScope);
   const scopeClause = req.userScope ? `AND domain = $${values.length}` : '';
+  const existingScopeClause = req.userScope ? 'AND domain = $3' : '';
 
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const existingResult = await client.query(
+        `SELECT id, assigned_to, priority, asset_id, domain
+         FROM public.work_orders
+         WHERE id = $1
+           AND tenant_id = $2
+           AND deleted_at IS NULL
+           ${existingScopeClause}
+         FOR UPDATE`,
+        req.userScope
+          ? [req.params.id, req.user.tenantId, req.userScope]
+          : [req.params.id, req.user.tenantId],
+      );
+      const existingWorkOrder = existingResult.rows[0];
+      if (!existingWorkOrder) return { workOrder: null };
+
       if (body.assignedTo) {
         if (!(await assigneeExists(
           client,
@@ -856,7 +889,6 @@ async function updateWorkOrder(req, res, next) {
       const workOrder = result.rows[0];
       if (!workOrder) return { workOrder: null };
 
-      let lowStockNotifications = [];
       if (shouldSyncParts) {
         const savedParts = await saveWorkOrderParts(client, {
           tenantId: req.user.tenantId,
@@ -867,7 +899,6 @@ async function updateWorkOrder(req, res, next) {
           replace: true,
         });
         workOrder.parts = savedParts.parts;
-        lowStockNotifications = savedParts.lowStockNotifications;
       } else {
         workOrder.parts = await getWorkOrderParts(
           client,
@@ -876,7 +907,39 @@ async function updateWorkOrder(req, res, next) {
           workOrder.domain,
         );
       }
-      return { workOrder, lowStockNotifications };
+
+      const assignmentChanged = body.assignedTo !== undefined
+        && String(body.assignedTo || '') !== String(existingWorkOrder.assigned_to || '');
+      const priorityBecameCritical = body.priority !== undefined
+        && body.priority !== existingWorkOrder.priority
+        && ['urgent', 'high'].includes(workOrder.priority);
+      if (assignmentChanged || priorityBecameCritical) {
+        const assetResult = await client.query(
+          `SELECT id, name
+           FROM public.assets
+           WHERE id = $1
+             AND tenant_id = $2`,
+          [workOrder.asset_id, req.user.tenantId],
+        );
+        const asset = assetResult.rows[0] ?? null;
+
+        if (assignmentChanged && workOrder.assigned_to) {
+          const technicianUserId = await getTechnicianUserId(
+            client,
+            workOrder.assigned_to,
+            req.user.tenantId,
+            workOrder.domain,
+          );
+          if (technicianUserId) {
+            await notifyWorkOrderAssigned(workOrder, technicianUserId, asset, client);
+          }
+        }
+        if (priorityBecameCritical) {
+          await notifyCriticalWorkOrder(workOrder, asset, client);
+        }
+      }
+
+      return { workOrder };
     });
 
     if (outcome.invalidAssignee) {
@@ -885,7 +948,6 @@ async function updateWorkOrder(req, res, next) {
     if (!outcome.workOrder) {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
     }
-    notifyLowStock(req.user.tenantId, req.userScope, outcome.lowStockNotifications);
     return res.json({ workOrder: outcome.workOrder });
   } catch (error) {
     if (error.code === 'INVALID_WORK_ORDER_PART') {
@@ -1080,7 +1142,7 @@ router.post(
            SET current_stock = current_stock - $1,
                updated_at = NOW()
            WHERE id = $2 AND tenant_id = $3 AND current_stock >= $1
-           RETURNING current_stock, min_stock, name, unit_of_measure`,
+           RETURNING current_stock, min_stock, name, part_number, unit_of_measure`,
           [quantity, part.id, req.user.tenantId],
         );
         if (stockResult.rowCount === 0) {
@@ -1104,6 +1166,13 @@ router.post(
             part.unit_cost,
           ],
         );
+        if (Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)) {
+          await notifyLowStock({
+            ...updatedPart,
+            tenant_id: req.user.tenantId,
+            domain: order.domain,
+          }, client);
+        }
         return {
           part: {
             ...applied,
@@ -1111,14 +1180,6 @@ router.post(
             part_number: part.part_number,
             unit_of_measure: part.unit_of_measure,
           },
-          lowStockNotification:
-            Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)
-              ? {
-                  name: updatedPart.name,
-                  newStock: updatedPart.current_stock,
-                  unitOfMeasure: updatedPart.unit_of_measure,
-                }
-              : null,
         };
       });
 
@@ -1133,9 +1194,6 @@ router.post(
       }
       if (outcome.insufficientStock) {
         return res.status(409).json({ message: 'Stock insuficiente para aplicar esta peça.' });
-      }
-      if (outcome.lowStockNotification) {
-        notifyLowStock(req.user.tenantId, req.userScope, [outcome.lowStockNotification]);
       }
       return res.status(201).json({ part: outcome.part });
     } catch (error) {

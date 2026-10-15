@@ -5,7 +5,7 @@ import {
   enforceDomainScope,
   requireRoles,
 } from '../middlewares/auth.js';
-import { sendNotificationSafe } from '../services/notificationService.js';
+import { notifyLowStock } from '../services/notificationService.js';
 
 const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
@@ -244,7 +244,8 @@ router.post(
     try {
       const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
         const partResult = await client.query(
-          `SELECT id, name, unit_of_measure, current_stock, min_stock, unit_cost
+          `SELECT id, tenant_id, domain, name, part_number, unit_of_measure,
+                  current_stock, min_stock, unit_cost
            FROM public.parts
            WHERE id = $1
              AND tenant_id = $2
@@ -264,7 +265,7 @@ router.post(
            SET current_stock = current_stock - $1,
                updated_at = NOW()
            WHERE id = $2 AND tenant_id = $3
-           RETURNING current_stock, min_stock, name, unit_of_measure`,
+               RETURNING current_stock, min_stock, name, part_number, unit_of_measure`,
           [quantity, part.id, req.user.tenantId],
         );
 
@@ -284,17 +285,14 @@ router.post(
           ],
         );
         const updatedPart = stockResult.rows[0];
-        return {
-          success: true,
-          lowStockNotification:
-            Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)
-              ? {
-                  name: updatedPart.name,
-                  newStock: updatedPart.current_stock,
-                  unitOfMeasure: updatedPart.unit_of_measure,
-                }
-              : null,
-        };
+        if (Number(updatedPart.current_stock) <= Number(updatedPart.min_stock)) {
+          await notifyLowStock({
+            ...updatedPart,
+            tenant_id: part.tenant_id,
+            domain: part.domain,
+          }, client);
+        }
+        return { success: true };
       });
 
       if (outcome.notFound) {
@@ -302,16 +300,6 @@ router.post(
       }
       if (outcome.insufficientStock) {
         return res.status(400).json({ error: 'Stock insuficiente para efetuar a saída.' });
-      }
-      if (outcome.lowStockNotification) {
-        void sendNotificationSafe({
-          tenantId: req.user.tenantId,
-          domain: req.userScope,
-          targetRole: 'supervisor',
-          title: 'Alerta de Stock Mínimo',
-          message: `A peça "${outcome.lowStockNotification.name}" atingiu o nível crítico (${outcome.lowStockNotification.newStock} ${outcome.lowStockNotification.unitOfMeasure}).`,
-          link: '/inventory',
-        });
       }
       return res.status(200).json({ message: 'Saída de stock registada com sucesso.' });
     } catch (error) {
