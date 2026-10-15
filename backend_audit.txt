@@ -1,139 +1,106 @@
 AUDITORIA TÉCNICA DO BACKEND CMMS
-Data da revisão: 2026-10-14
-Escopo: código em src/ e suporte de persistência/contratos observados no repositório.
-Status geral: backend em Express + PostgreSQL, com autenticação por cookie JWT, isolamento multi-tenant suportado por withTenantContext() e contexto PG (app.current_tenant / app.current_user_role).
+Data da revisão: 2026-10-15
+Escopo: código em src/ e migrações SQL versionadas em supabase/migrations/.
+Limitação: revisão estática do repositório; não houve ligação ao PostgreSQL de destino nem execução de testes automatizados.
 
 RESUMO EXECUTIVO
 ----------------
-- A API principal está em src/server.js e monta rotas em /api.
-- A autenticação usa cookies HttpOnly com o token auth_token e validação JWT em src/middlewares/auth.js.
-- O acesso ao banco é feito via pg Pool com SSL habilitado e transações por helper com set_config.
-- O backend foi estruturado para multi-tenancy, mas a segurança operacional depende fortemente do contrato do banco e da consistência das regras em cada endpoint.
-- Há um conjunto de pontos de atenção no código atual: alguns endpoints dependem de schema externo/DB não verificado neste repositório; a validação de escopo nem sempre é explícita em todas as rotas; e o inventário/stock não parece ser totalmente sincronizado por triggers, mas sim de forma manual no código.
-- O arquivo foi revisado e reescrito para remover conteúdo fragmentado e refletir o estado atual do código fonte observado.
+- A API usa Express e PostgreSQL via pg Pool, com módulos de rotas separados por domínio.
+- O helper withTenantContext() inicia transações e define app.current_tenant e app.current_user_role para as queries que o utilizam.
+- As rotas de ativos, combustível, ordens de serviço, técnicos, notificações, peças e dashboard aplicam autenticação e enforceDomainScope. As rotas de administração e utilizadores aplicam controlos próprios por perfil.
+- O conjunto de migrações versionadas cobre várias tabelas operacionais e políticas RLS, mas não inclui a criação do esquema base de tenants, app_users e assets. A existência e configuração desse esquema no ambiente alvo continuam por confirmar.
+- A auditoria anterior exagerava a falta de migrações, a inconsistência de escopo por rota e o risco de falhas no consumo de peças. Esses pontos foram revistos abaixo com base no código e nas migrações atuais.
 
-1. ARQUITETURA DO BACKEND
-------------------------
-- Framework: Express (ES modules).
-- Entrada: src/server.js
-- Rotas montadas:
-  - /api/auth
-  - /api/super-admin
-  - /api/admin
-  - /api/users
-  - /api/assets
-  - /api/fuel
-  - /api/work-orders
-  - /api/technicians
-  - /api/notifications
-  - /api/parts
-  - /api/dashboard
-- Middleware global:
-  - CORS com credentials e FRONTEND_URL
-  - express.json()
-  - cookieParser()
-  - Handler global de erro
-- Health check: GET /health
+1. ARQUITETURA
+--------------
+- Runtime: Node.js com ES modules e Express.
+- Entrada: src/server.js; health check: GET /health.
+- Prefixos montados: /api/auth, /api/super-admin, /api/admin, /api/users, /api/assets, /api/fuel, /api/work-orders, /api/technicians, /api/notifications, /api/parts e /api/dashboard.
+- Middleware global: CORS com credenciais e origem configurada por FRONTEND_URL, express.json(), cookieParser() e handler global de erro.
+- Persistência: pg.Pool configurado com DATABASE_URL e SSL; o código define rejectUnauthorized: false.
 
-2. CONEXÃO E CONTEXTO MULTI-TENANT
------------------------------------
-- src/db.js define um Pool PostgreSQL usando DATABASE_URL e ssl: { rejectUnauthorized: false }.
-- withTenantContext(tenantId, userRole, callback):
-  1. conecta ao pool
-  2. inicia transação com BEGIN
-  3. chama set_config('app.current_tenant', tenantId ?? '', true)
-  4. chama set_config('app.current_user_role', userRole, true)
-  5. executa a callback
-  6. COMMIT em sucesso e ROLLBACK em erro
-- Este padrão é consistente com a estratégia de isolamento por tenant e com políticas RLS esperadas no PostgreSQL.
-- O uso do helper está presente em rotas de negócio, o que reduz o risco de queries sem contexto tenant.
+2. BANCO DE DADOS E ISOLAMENTO MULTI-TENANT
+-------------------------------------------
+- withTenantContext(tenantId, userRole, callback), em src/db.js, adquire uma ligação, executa BEGIN, define app.current_tenant e app.current_user_role via set_config(..., true), executa a callback e faz COMMIT ou ROLLBACK.
+- As rotas operacionais observadas usam este helper para as operações no banco. A autenticação constitui uma exceção: login e /api/auth/me consultam diretamente o pool, sem contexto tenant.
+- Migrações incluídas criam ou ajustam work_orders, technicians, work_order_events, asset_documents, notifications, parts, work_order_parts, stock_movements e fuel_logs. Também adicionam limites/escalas operacionais, compatibilidade de custos e a coluna assets.province.
+- As migrações definem RLS para as tabelas operacionais abrangidas, com políticas que usam app.current_tenant e permitem acesso quando app.current_user_role = 'super_admin'.
+- O repositório não contém uma migração de criação do esquema base tenants, app_users e assets. Também não permite confirmar a configuração efetiva de RLS, o proprietário das tabelas, o estado das migrações ou eventuais diferenças no banco de produção.
 
 3. AUTENTICAÇÃO E AUTORIZAÇÃO
 -----------------------------
-- O token é lido do cookie auth_token.
-- authenticateToken() valida JWT_SECRET, aceita apenas roles conhecidos e preenche req.user com:
-  - id
-  - tenantId
-  - role
-  - fullName
-  - operational_scope
-- req.userScope usa req.user.operational_scope || 'fleet'.
-- enforceDomainScope() valida:
-  - role válida
-  - tenantId definido para usuários não super_admin
-  - escopo do usuário é fleet ou plant
-  - o escopo pedido (query/domain/header) é válido e correspondentes ao usuário
-  - a empresa (tenant) aceita o mesmo escopo, exceto quando operational_scope = 'mixed'
-- requireRole() e requireRoles() limitam acesso por perfil.
-- checkTenantLimits() limita criação de ativos e usuários com base em max_assets_limit e max_users_limit do tenant.
+- O login verifica bcrypt e emite JWT com validade de 8 horas. O token é enviado num cookie auth_token HttpOnly e também incluído no corpo JSON da resposta.
+- authenticateToken() aceita token pelo cookie ou pelo cabeçalho Bearer, valida a assinatura e restringe os perfis a super_admin, tenant_admin, supervisor, technician e driver_operator.
+- /api/auth/me consulta novamente o estado do utilizador e do tenant. As rotas protegidas, por sua vez, validam o token sem consultar a cada pedido se o utilizador continua ativo; um JWT emitido permanece utilizável até expirar, mesmo após desativação, salvo mecanismos externos de revogação.
+- enforceDomainScope() valida o perfil, o tenant, o escopo fleet/plant do token, o escopo solicitado e a compatibilidade com operational_scope do tenant; super_admin é exceção. Este middleware está aplicado às principais rotas operacionais.
+- /api/users é restrito a super_admin; /api/admin e /api/super-admin também usam controlo explícito de perfil.
 
-4. MAPEAMENTO DE DOMÍNIO E ESCOPOS OPERACIONAIS
------------------------------------------------
-- O backend trabalha com os escopos fleet e plant.
-- A regra central observada em código é:
-  - se o tenant for 'mixed', o usuário pode operar em qualquer um dos escopos do tenant;
-  - se o tenant não for 'mixed', o escopo do usuário precisa bater com o tenant.
-- Em prática, a camada de autorização depende de dois pontos:
-  1. o token JWT conter operational_scope correto;
-  2. os dados do tenant e do usuário estarem coerentes no banco.
-- O código não mostra a presença de uma tabela business_types ou outra lógica alternativa para esse controle; a validação funcional observada é mediatizada por operational_scope.
-
-5. ROTAS PRINCIPAIS OBSERVADAS
+4. ROTAS E DADOS OPERACIONAIS
 -----------------------------
-- Auth (/api/auth): login, logout, me
-- Super admin (/api/super-admin): gestão de tenants e admin global
-- Admin tenant (/api/admin): gestão de tenants e permissões de admin
-- Usuários (/api/users): criação, listagem, atualização e bloqueio de usuários
-- Ativos (/api/assets): CRUD, documentos, meter updates e soft-delete
-- Fuel logs (/api/fuel): listagem e registro de abastecimentos
-- Work orders (/api/work-orders): criação, atualização, transições, partes, fechamento
-- Técnicos (/api/technicians): cadastro e listagem por tenant/escopo
-- Notificações (/api/notifications): alertas de work orders e atribuições
-- Peças / estoque (/api/parts): listagem, restock, withdraw e movimentos de stock
-- Dashboard (/api/dashboard): indicadores e visão de operações
+- Ativos: CRUD, documentos, atualização de contador e remoção lógica. Uploads aceitam PDF e imagens JPEG/PNG/WebP, até 20 MiB.
+- Combustível: limitado ao escopo fleet; verifica tenant, domínio do ativo, capacidade do tanque quando definida e não diminuição do contador.
+- Ordens de serviço: valida tipos, estados, perfis e transições; regista eventos e associa peças à ordem.
+- Peças/stock: inclui criação, reposição e retirada, com registo em stock_movements.
+- Notificações: filtradas por tenant, domínio, utilizador e/ou perfil.
+- Técnicos e dashboard: rotas operacionais com autenticação, escopo e consultas por tenant.
+- As tabelas operacionais mencionadas têm suporte em migrações versionadas; a verificação de compatibilidade final depende de executar as migrações contra o esquema real.
 
-6. PONTOS POSITIVOS IDENTIFICADOS
---------------------------------
-- Estrutura modular e clara, com rotas separadas por domínio.
-- Uso consistente de withTenantContext() para queries operacionais.
-- Configuração centralizada de autenticação e escopo.
-- Tratamento de erros global com resposta JSON padronizada.
-- Uso de transações para operações sensíveis e com locks em alguns fluxos críticos.
-- Criação de stock movement explicitamente em endpoints de restock/withdraw, conforme padrão do código.
+5. PONTOS POSITIVOS
+-------------------
+- Separação modular de rotas e uso de consultas parametrizadas.
+- Contexto tenant transacional centralizado nas rotas operacionais.
+- Middleware de domínio aplicado de forma consistente às principais rotas de negócio, com exceções administrativas explícitas.
+- Operações de stock e associação de peças a ordens de serviço agrupam atualização de saldo e registo de movimento na mesma transação. Reposição/retirada bloqueiam a linha da peça; o consumo em ordem valida o saldo na atualização.
+- As migrações das tabelas operacionais incluem índices, constraints e políticas RLS relevantes.
+- Limites de utilizadores são verificados dentro de transação que bloqueia a linha do tenant na criação pelo super_admin.
 
-7. RISCOS E FRAQUEZAS TÉCNICAS
+6. RISCOS E PONTOS DE ATENÇÃO
 -----------------------------
-A. Dependência de schema externo e migrações não verificadas
-- O código referencia tabelas e colunas que não aparecem em todos os arquivos do repositório.
-- Isso implica que parte do comportamento operacional depende de um esquema de banco que pode estar em um ambiente externo ou em migrates não versionadas.
-- Impacto: risco de runtime drift e início de produção com endpoints quebrando por ausência de colunas/tabelas.
+A. Esquema base e estado do banco não verificáveis no repositório
+- As migrações cobrem tabelas e extensões operacionais, mas dependem de tenants, app_users e assets já existentes.
+- Impacto: uma instalação sem o esquema base compatível, ou com migrações pendentes, pode falhar em runtime. A efetividade das políticas RLS também depende da configuração real do PostgreSQL.
 
-B. Validação de escopo por rota ainda não é homogênea
-- Há endpoints em que enforceDomainScope é aplicado e outros em que a proteção depende de regras locais ou de contexto SQL.
-- Impacto: comportamento pode variar por endpoint e por tenant; correções de segurança precisam ser padronizadas.
+B. Contexto tenant nas consultas de autenticação
+- Login e /api/auth/me usam pool.query diretamente, sem withTenantContext(). Estas consultas precisam de acesso funcional a app_users/tenants antes de estabelecer o tenant do utilizador.
+- Impacto: confirmar que os privilégios e políticas do banco permitem apenas o acesso pretendido nestas operações e não dependem de contexto tenant inexistente.
 
-C. Inventário e consumo de peças precisam ser auditados com cuidado
-- O código de stock apresenta atualização manual em endpoints específicos, mas o controle do consumo em work orders pode não refletir em todos os fluxos de forma consistente.
-- Impacto: risco de inconsistência entre work_order_parts, parts.current_stock e stock_movements.
+C. Revogação de sessões não imediata
+- authenticateToken() confia nos dados do JWT até ao fim da validade de 8 horas; a verificação de utilizador ativo em /api/auth/me não é repetida nas rotas protegidas.
+- Impacto: uma conta desativada ou alterada pode continuar a aceder às rotas até à expiração do token.
 
-D. O token e a lógica de escopo ainda podem ser fracos se dados de usuário/tenant forem inconsistentes
-- Se operational_scope vier ausente no JWT, o código converte silenciosamente para 'fleet'.
-- Impacto: a segurança correta depende de dados confiáveis no token e no banco; qualquer inconsistência pode abrir brechas de acesso ou produzir 403s inesperados.
+D. Verificação do certificado TLS do PostgreSQL desativada
+- A configuração SSL define rejectUnauthorized: false.
+- Impacto: a ligação usa SSL, mas não valida a cadeia/identidade do certificado do servidor; avaliar configuração de CA e validação estrita no ambiente de produção.
 
-E. Ausência de evidência de triggers de negócio no código versionado
-- O inventário é atualizado explicitamente em código da API; não foi observado trigger SQL no repositório como mecanismo central de consistência.
-- Impacto: consistência de negócio fica mais dependente de cada endpoint e do rigor do código de cada rota.
+E. Limite de ativos sujeito a concorrência
+- checkTenantLimits('assets') conta os ativos numa transação do middleware, que termina antes da inserção do novo ativo.
+- Impacto: pedidos concorrentes podem ambos observar capacidade disponível e ultrapassar max_assets_limit. A criação de utilizadores, ao contrário, bloqueia a linha do tenant durante a verificação e inserção.
 
-8. RECOMENDAÇÕES PRIORITÁRIAS
------------------------------
-1. Validar schema do PostgreSQL no ambiente target e confirmar que todas as tabelas usadas no código existem e têm os campos esperados.
-2. Padronizar enforceDomainScope em todas as rotas sensíveis, principalmente fuel logs, notifications e outros fluxos de leitura/escrita que dependem de tenant/domain.
-3. Revisar o ciclo de stock para garantir consistência entre work_order_parts, parts.current_stock e stock_movements em todas as operações.
-4. Centralizar regras de validação de escopo/tenant em middleware ou helper compartilhado para reduzir variação entre endpoints.
-5. Documentar claramente a política de operational_scope, mixed vs fleet/plant, e garantir que JWT, banco e UX usem a mesma convenção.
+F. Exposição de mensagens de erro
+- O handler global envia err.message na resposta, incluindo para erros 500.
+- Impacto: erros de banco ou detalhes internos podem ser devolvidos ao cliente; em produção, preferir mensagem genérica e manter detalhes apenas nos logs.
 
-9. CONCLUSÃO
+G. Token acessível ao cliente apesar do cookie HttpOnly
+- A resposta de login inclui o JWT no corpo e o middleware também aceita Authorization: Bearer.
+- Impacto: clientes podem armazenar o token fora do cookie HttpOnly, reduzindo a proteção contra leitura por JavaScript; confirmar se esse modo dual é intencional.
+
+H. Reconciliação de stock sem mecanismo automático no banco
+- O código da API atualiza parts.current_stock e stock_movements dentro de transações, incluindo o consumo/devolução associados a work_order_parts. Não foram encontrados triggers SQL de negócio para manter estes valores sincronizados se houver escrita fora dos fluxos da API.
+- Impacto: integrações ou alterações diretas ao banco podem causar divergência; definir uma rotina de reconciliação e preservar o uso transacional da API.
+
+7. RECOMENDAÇÕES PRIORIZADAS
+----------------------------
+1. Validar, no ambiente alvo, o esquema base, a ordem/estado das migrações, privilégios e políticas RLS efetivas.
+2. Definir política de revogação de sessão para utilizadores desativados (por exemplo, verificação no middleware ou mecanismo de versão/revogação do token).
+3. Ativar validação do certificado TLS do PostgreSQL com a CA apropriada em produção.
+4. Tornar atómica a verificação e criação de ativos relativamente a max_assets_limit, usando bloqueio/serialização ou constraint apropriada.
+5. Evitar devolver mensagens internas em respostas 500.
+6. Confirmar se são necessários o JWT no corpo e a autenticação pelo cabeçalho Authorization; se a intenção for autenticação exclusivamente por cookie HttpOnly, remover o caminho alternativo.
+7. Definir rotina de reconciliação de parts.current_stock com stock_movements e work_order_parts, especialmente para alterações fora da API.
+8. Executar testes de integração contra o PostgreSQL com RLS habilitado; não há ficheiros de teste identificados no repositório nesta revisão.
+
+8. CONCLUSÃO
 ------------
-O backend está bem estruturado como API Express com isolamento multi-tenant em nível de código e uso de transação por tenant. A base da arquitetura é sólida, com separação por domínio e uso de helper centralizado para contexto tenant. No entanto, a robustez em produção exige confirmação do schema real do banco, padronização da validação de escopo e revisão da consistência de estoque e dados de domínio.
+O backend tem uma base modular e um padrão útil de contexto tenant transacional, com middleware de escopo aplicado às principais rotas operacionais e migrações para várias tabelas e políticas RLS. A auditoria estática não confirma o estado efetivo do banco de produção. As prioridades são verificar esse contrato de banco, fechar a janela de revogação de tokens, validar TLS, tornar atómico o limite de ativos e reduzir a exposição de erros internos.
 
-Este arquivo foi atualizado em 2026-10-14 para refletir o estado atual observado no código-fonte do repositório.
+Este ficheiro foi atualizado em 2026-10-15 com base no código e nas migrações versionadas no repositório.
