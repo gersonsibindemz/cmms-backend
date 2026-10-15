@@ -65,7 +65,7 @@ router.post('/', async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const assetResult = await client.query(
-        `SELECT id, domain
+        `SELECT id, current_meter, fuel_tank_capacity_liters, domain
          FROM public.assets
          WHERE id = $1::uuid
            AND tenant_id = $2::uuid
@@ -75,6 +75,26 @@ router.post('/', async (req, res, next) => {
       const asset = assetResult.rows[0];
       if (!asset) return { assetNotFound: true };
       if (asset.domain !== 'fleet') return { wrongScope: true };
+
+      if (
+        asset.fuel_tank_capacity_liters !== null
+        && Number(asset.fuel_tank_capacity_liters) > 0
+        && liters > Number(asset.fuel_tank_capacity_liters)
+      ) {
+        return {
+          fuelTankCapacityExceeded: true,
+          error: `A quantidade abastecida (${liters}L) excede a capacidade máxima do tanque do veículo (${asset.fuel_tank_capacity_liters}L).`,
+        };
+      }
+      if (
+        asset.current_meter !== null
+        && currentMeter < Number(asset.current_meter)
+      ) {
+        return {
+          meterCannotDecrease: true,
+          error: `A quilometragem informada (${currentMeter}) não pode ser inferior ao contador atual registrado no ativo (${asset.current_meter}).`,
+        };
+      }
 
       const result = await client.query(
         `INSERT INTO fuel_logs (
@@ -114,6 +134,9 @@ router.post('/', async (req, res, next) => {
     }
     if (outcome.wrongScope) {
       return res.status(403).json({ message: 'O ativo não pertence ao escopo de frota.' });
+    }
+    if (outcome.fuelTankCapacityExceeded || outcome.meterCannotDecrease) {
+      return res.status(400).json({ error: outcome.error });
     }
     return res.status(201).json({ fuelLog: outcome.fuelLog });
   } catch (error) {

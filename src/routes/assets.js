@@ -254,7 +254,7 @@ router.get('/', requireTenant, async (req, res) => {
         `
       SELECT 
         id, code_tag, name, category, criticality_level, brand, model, manufacture_year, domain,
-        current_meter, meter_kind, status, cost_center,
+        current_meter, meter_kind, status, cost_center, province,
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
         insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
@@ -524,7 +524,7 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
   try {
     const {
       codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
-      currentMeter, meterKind, costCenter,
+      currentMeter, meterKind, costCenter, province,
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
       plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
@@ -554,18 +554,18 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
     const insertQuery = `
       INSERT INTO public.assets (
         tenant_id, code_tag, name, category, criticality_level, brand, model, manufacture_year,
-        current_meter, meter_kind, cost_center,
+        current_meter, meter_kind, cost_center, province,
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
         insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs, domain
       ) VALUES (
         $1, $2, $3, $4, COALESCE($5, 'B'), $6, $7, $8,
-        COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11,
-        $12, $13, $14, $15,
-        $16, $17, $18, $19,
-        $20, $21, $22, $23,
-        $24, $25, $26, COALESCE($27, '{}'::jsonb), $28
+        COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11, $12,
+        $13, $14, $15, $16,
+        $17, $18, $19, $20,
+        $21, $22, $23, $24,
+        $25, $26, $27, COALESCE($28, '{}'::jsonb), $29
       ) RETURNING *;
     `;
 
@@ -573,7 +573,7 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
       req.user.tenantId, finalCodeTag, name, category, emptyToNull(criticalityLevel),
       emptyToNull(brand), emptyToNull(model), emptyToNull(manufactureYear),
       emptyToNull(currentMeter) ?? 0, emptyToNull(meterKind) ?? 'odometer_km',
-      emptyToNull(costCenter), emptyToNull(licensePlate), emptyToNull(chassisVin),
+      emptyToNull(costCenter), emptyToNull(province), emptyToNull(licensePlate), emptyToNull(chassisVin),
       emptyToNull(engineNumber), emptyToNull(inatroInspectionExpiry),
       emptyToNull(insurancePolicyNumber), emptyToNull(insuranceCompany),
       emptyToNull(insuranceExpiry), emptyToNull(fuelTankCapacityLiters),
@@ -610,6 +610,7 @@ async function updateAsset(req, res) {
       ['model', 'model'],
       ['manufactureYear', 'manufacture_year'],
       ['costCenter', 'cost_center'],
+      ['province', 'province'],
       ['status', 'status'],
       ['licensePlate', 'license_plate'],
       ['chassisVin', 'chassis_vin'],
