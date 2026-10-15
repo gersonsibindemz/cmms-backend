@@ -101,15 +101,75 @@ router.post('/logout', (req, res) => {
 });
 
 // GET /api/auth/me
-router.get('/me', (req, res) => {
+router.get('/me', async (req, res) => {
   const token = req.cookies?.auth_token;
   if (!token) return res.status(401).json({ authenticated: false });
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    return res.json({ authenticated: true, user: decoded });
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
   } catch {
     return res.status(401).json({ authenticated: false });
+  }
+
+  if (!decoded || typeof decoded !== 'object') {
+    return res.status(401).json({ authenticated: false });
+  }
+
+  const userId = decoded.userId || decoded.id;
+  if (!userId) return res.status(401).json({ authenticated: false });
+
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.tenant_id, u.full_name, u.email, u.role, u.is_active, u.operational_scope,
+              t.name AS tenant_name, t.operational_scope AS tenant_scope, t.is_active AS tenant_active
+       FROM public.app_users u
+       LEFT JOIN public.tenants t ON t.id = u.tenant_id
+       WHERE u.id = $1::uuid
+         AND u.deleted_at IS NULL`,
+      [userId],
+    );
+
+    const freshUser = result.rows[0];
+    if (
+      !freshUser
+      || freshUser.is_active === false
+      || (freshUser.role !== 'super_admin' && freshUser.tenant_active !== true)
+    ) {
+      res.clearCookie('auth_token', {
+        httpOnly: true,
+        secure: IS_PROD,
+        sameSite: IS_PROD ? 'none' : 'lax',
+      });
+      return res.status(401).json({
+        authenticated: false,
+        message: 'Sessão revogada ou utilizador desativado.',
+      });
+    }
+
+    return res.status(200).json({
+      authenticated: true,
+      user: {
+        id: freshUser.id,
+        fullName: freshUser.full_name,
+        email: freshUser.email,
+        role: freshUser.role,
+        tenantId: freshUser.tenant_id,
+        tenantName: freshUser.tenant_name,
+        operational_scope: freshUser.operational_scope,
+        tenant: {
+          id: freshUser.tenant_id,
+          name: freshUser.tenant_name,
+          operational_scope: freshUser.tenant_scope,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Erro ao validar sessão:', error);
+    return res.status(500).json({
+      authenticated: false,
+      message: 'Erro interno ao validar sessão.',
+    });
   }
 });
 
