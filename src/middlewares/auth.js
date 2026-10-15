@@ -11,7 +11,13 @@ const USER_ROLES = new Set([
 ]);
 
 export function authenticateToken(req, res, next) {
-  const token = req.cookies?.auth_token;
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.cookies?.auth_token) {
+    token = req.cookies.auth_token;
+  }
 
   if (!token) {
     return res.status(401).json({ message: 'Autenticação necessária.' });

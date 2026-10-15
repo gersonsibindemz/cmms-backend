@@ -22,7 +22,7 @@ router.post('/login', async (req, res) => {
   try {
     // 1. Busca usuário e dados da empresa
     const userQuery = await pool.query(
-      `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.role, u.is_active,
+      `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.email, u.role, u.is_active,
               u.operational_scope,
               t.is_active as tenant_active, t.name as tenant_name
        FROM app_users u
@@ -75,9 +75,11 @@ router.post('/login', async (req, res) => {
 
     return res.status(200).json({
       message: 'Login realizado com sucesso.',
+      token,
       user: {
         id: user.id,
         fullName: user.full_name,
+        email: user.email,
         role: user.role,
         tenantId: user.tenant_id,
         tenantName: user.tenant_name,
@@ -102,7 +104,13 @@ router.post('/logout', (req, res) => {
 
 // GET /api/auth/me
 router.get('/me', async (req, res) => {
-  const token = req.cookies?.auth_token;
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.cookies?.auth_token) {
+    token = req.cookies.auth_token;
+  }
   if (!token) return res.status(401).json({ authenticated: false });
 
   let decoded;
