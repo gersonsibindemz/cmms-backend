@@ -11,6 +11,7 @@ import fuelLogRoutes from './routes/fuelLogs.js';
 import workOrderRoutes from './routes/workOrders.js';
 import technicianRoutes from './routes/technicians.js';
 import notificationRoutes from './routes/notifications.js';
+import maintenanceNotificationsRouter from './routes/maintenanceNotifications.js';
 import partsRoutes from './routes/parts.js';
 import dashboardRoutes from './routes/dashboard.js';
 
@@ -38,6 +39,7 @@ app.use('/api/fuel', fuelLogRoutes);
 app.use('/api/work-orders', workOrderRoutes);
 app.use('/api/technicians', technicianRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/maintenance-notifications', maintenanceNotificationsRouter);
 app.use('/api/parts', partsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
