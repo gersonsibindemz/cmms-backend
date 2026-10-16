@@ -254,9 +254,11 @@ router.get('/', requireTenant, async (req, res) => {
         `
       SELECT 
         id, code_tag, name, category, criticality_level, brand, model, manufacture_year, domain,
-        current_meter, meter_kind, status, cost_center, province,
+        operational_scope, current_meter::double precision AS current_meter,
+        meter_kind, status, cost_center, province,
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
-        insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
+        insurance_policy_number, insurance_company, insurance_expiry,
+        fuel_tank_capacity_liters::double precision AS fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs,
         created_at
@@ -282,7 +284,8 @@ router.get('/:id', requireTenant, async (req, res) => {
     const { id } = req.params;
     const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT * FROM public.assets
+        `SELECT *
+         FROM public.assets
          WHERE (id::text = $1 OR code_tag = $1)
            AND tenant_id = $2
            AND deleted_at IS NULL
@@ -295,7 +298,15 @@ router.get('/:id', requireTenant, async (req, res) => {
       return res.status(404).json({ error: 'Ativo não encontrado ou sem permissão de acesso.' });
     }
 
-    return res.json({ asset: rows[0] });
+    return res.json({
+      asset: {
+        ...rows[0],
+        current_meter: rows[0].current_meter === null ? null : Number(rows[0].current_meter),
+        fuel_tank_capacity_liters: rows[0].fuel_tank_capacity_liters === null
+          ? null
+          : Number(rows[0].fuel_tank_capacity_liters),
+      },
+    });
   } catch (error) {
     console.error('Erro ao obter ativo:', error);
     return res.status(500).json({ error: 'Erro interno ao consultar ativo' });

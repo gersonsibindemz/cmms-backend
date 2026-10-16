@@ -56,8 +56,14 @@ router.post('/', async (req, res, next) => {
     typeof fuelType !== 'string' ||
     !fuelType.trim() ||
     typeof liters !== 'number' ||
+    !Number.isFinite(liters) ||
+    liters <= 0 ||
     typeof pricePerLiterMzn !== 'number' ||
-    typeof currentMeter !== 'number'
+    !Number.isFinite(pricePerLiterMzn) ||
+    pricePerLiterMzn < 0 ||
+    typeof currentMeter !== 'number' ||
+    !Number.isFinite(currentMeter) ||
+    currentMeter < 0
   ) {
     return res.status(400).json({ message: 'Dados obrigatórios do abastecimento inválidos.' });
   }
@@ -69,7 +75,8 @@ router.post('/', async (req, res, next) => {
          FROM public.assets
          WHERE id = $1::uuid
            AND tenant_id = $2::uuid
-           AND deleted_at IS NULL`,
+           AND deleted_at IS NULL
+         FOR UPDATE`,
         [assetId, req.user.tenantId],
       );
       const asset = assetResult.rows[0];
@@ -83,7 +90,7 @@ router.post('/', async (req, res, next) => {
       ) {
         return {
           fuelTankCapacityExceeded: true,
-          error: `A quantidade abastecida (${liters}L) excede a capacidade máxima do tanque do veículo (${asset.fuel_tank_capacity_liters}L).`,
+          error: `O volume abastecido (${liters}L) não pode exceder a capacidade máxima do tanque (${Number(asset.fuel_tank_capacity_liters)}L).`,
         };
       }
       if (
@@ -92,7 +99,7 @@ router.post('/', async (req, res, next) => {
       ) {
         return {
           meterCannotDecrease: true,
-          error: `A quilometragem informada (${currentMeter}) não pode ser inferior ao contador atual registrado no ativo (${asset.current_meter}).`,
+          error: `A quilometragem no abastecimento (${currentMeter}) não pode ser inferior ao último contador registrado no veículo (${Number(asset.current_meter)}).`,
         };
       }
 
@@ -125,6 +132,14 @@ router.post('/', async (req, res, next) => {
           receiptDocRef ?? null,
           receiptPhotoUrl ?? null,
         ],
+      );
+      await client.query(
+        `UPDATE public.assets
+         SET current_meter = $1,
+             updated_at = NOW()
+         WHERE id = $2
+           AND tenant_id = $3`,
+        [currentMeter, assetId, req.user.tenantId],
       );
       return { fuelLog: result.rows[0] };
     });
