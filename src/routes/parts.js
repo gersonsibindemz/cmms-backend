@@ -22,10 +22,6 @@ function requireTenant(req, res, next) {
 router.get('/', requireTenant, async (req, res, next) => {
   const values = [req.user.tenantId];
   const filters = ['tenant_id = $1', 'deleted_at IS NULL'];
-  if (req.userScope) {
-    values.push(req.userScope);
-    filters.push(`domain = $${values.length}`);
-  }
 
   const search = req.query.search;
   if (search !== undefined && search !== '') {
@@ -50,14 +46,28 @@ router.get('/', requireTenant, async (req, res, next) => {
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT *
+        `SELECT id,
+                tenant_id,
+                domain,
+                part_number,
+                part_number AS oem_reference,
+                name,
+                category,
+                unit_of_measure,
+                location,
+                location AS warehouse_location,
+                current_stock,
+                min_stock,
+                unit_cost,
+                created_at,
+                updated_at
          FROM public.parts
          WHERE ${filters.join(' AND ')}
          ORDER BY name ASC`,
         values,
       ),
     );
-    return res.json({ parts: result.rows });
+    return res.status(200).json({ parts: result.rows, total: result.rows.length });
   } catch (error) {
     return next(error);
   }

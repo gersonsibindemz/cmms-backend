@@ -248,6 +248,11 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
 
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', requireTenant, async (req, res) => {
+  const domain = req.query.domain;
+  if (domain !== undefined && !['fleet', 'plant'].includes(domain)) {
+    return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
@@ -264,14 +269,14 @@ router.get('/', requireTenant, async (req, res) => {
         created_at
       FROM public.assets
       WHERE tenant_id = $1::uuid
-        AND (domain = $2 OR operational_scope = $2)
+        AND ($2::text IS NULL OR domain = $2)
         AND deleted_at IS NULL
       ORDER BY created_at DESC;
     `,
-        [req.user.tenantId, req.userScope],
+        [req.user.tenantId, domain ?? null],
       ),
     );
-    res.json({ assets: result.rows });
+    res.status(200).json({ assets: result.rows, total: result.rows.length });
   } catch (error) {
     console.error('Erro ao listar ativos:', error);
     res.status(500).json({ error: 'Erro interno ao listar ativos' });

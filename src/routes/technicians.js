@@ -44,9 +44,8 @@ router.get('/', requireTenant, async (req, res, next) => {
          WHERE t.tenant_id = $1
            AND t.deleted_at IS NULL
            AND (t.status = 'active' OR t.status IS NULL)
-           AND (t.domain = $2 OR t.operational_scope = $2)
          ORDER BY name ASC`,
-        [req.user.tenantId, req.userScope],
+        [req.user.tenantId],
       ),
     );
 

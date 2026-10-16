@@ -4,7 +4,16 @@ import { authenticateToken, enforceDomainScope } from '../middlewares/auth.js';
 
 const router = Router();
 
-router.use(authenticateToken, enforceDomainScope, (req, res, next) => {
+router.use(authenticateToken, (req, res, next) => {
+  if (req.method === 'GET' && req.path === '/') {
+    if (!req.user.tenantId) {
+      return res.status(403).json({ message: 'A empresa do utilizador não está definida.' });
+    }
+    return next();
+  }
+  return enforceDomainScope(req, res, next);
+}, (req, res, next) => {
+  if (req.method === 'GET' && req.path === '/') return next();
   if (req.userScope !== 'fleet') {
     return res.status(403).json({ message: 'O módulo de combustível está disponível apenas no escopo de frota.' });
   }
@@ -70,20 +79,21 @@ router.get('/', async (req, res, next) => {
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT fuel_logs.*, assets.code_tag AS asset_code_tag
-         FROM public.fuel_logs AS fuel_logs
-         JOIN public.assets AS assets
-           ON assets.id = fuel_logs.asset_id
-          AND assets.tenant_id = fuel_logs.tenant_id
-          AND assets.deleted_at IS NULL
-         WHERE fuel_logs.tenant_id = $1::uuid
-           AND (assets.domain = 'fleet' OR assets.operational_scope = 'fleet')
-         ORDER BY fuel_logs.logged_at DESC`,
+        `SELECT fl.*,
+                a.name AS asset_name,
+                a.code_tag AS asset_code_tag,
+                a.license_plate AS asset_license_plate
+         FROM public.fuel_logs AS fl
+         LEFT JOIN public.assets AS a
+           ON a.id = fl.asset_id
+          AND a.tenant_id = fl.tenant_id
+         WHERE fl.tenant_id = $1::uuid
+         ORDER BY fl.logged_at DESC`,
         [req.user.tenantId],
       ),
     );
 
-    return res.json({ fuelLogs: result.rows });
+    return res.status(200).json({ fuelLogs: result.rows, total: result.rows.length });
   } catch (error) {
     return next(error);
   }

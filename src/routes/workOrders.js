@@ -239,15 +239,14 @@ async function saveWorkOrderParts(client, {
 }
 
 router.get('/', requireTenant, async (req, res, next) => {
-  const { id: userId, role, tenantId } = req.user;
+  const { role, tenantId } = req.user;
   const filters = [];
-  const values = [tenantId, req.userScope];
-  filters.push('(assets.domain = $2 OR work_orders.domain = $2)');
+  const values = [tenantId];
 
   for (const [queryKey, column] of [
-    ['status', 'work_orders.status'],
-    ['priority', 'work_orders.priority'],
-    ['asset_id', 'work_orders.asset_id'],
+    ['status', 'wo.status'],
+    ['priority', 'wo.priority'],
+    ['asset_id', 'wo.asset_id'],
   ]) {
     const value = req.query[queryKey];
     if (value === undefined || value === '') continue;
@@ -263,76 +262,49 @@ router.get('/', requireTenant, async (req, res, next) => {
   }
 
   try {
-    const result = await withTenantContext(tenantId, role, async (client) => {
-      const queryFilters = [...filters];
-      const queryValues = [...values];
-
-      if (role === 'technician') {
-        const technicianResult = await client.query(
-          `SELECT id
-           FROM public.technicians
-           WHERE user_id = $1
-             AND tenant_id = $2
-             AND deleted_at IS NULL
-             ${req.userScope ? 'AND domain = $3' : ''}
-           LIMIT 1`,
-          req.userScope ? [userId, tenantId, req.userScope] : [userId, tenantId],
-        );
-        const technicianId = technicianResult.rows[0]?.id;
-        if (!technicianId) return { rows: [] };
-
-        queryValues.push(userId, technicianId);
-        queryFilters.push(
-          `(work_orders.assigned_to = $${queryValues.length - 1}
-            OR work_orders.assigned_to = $${queryValues.length}
-            OR (work_orders.assigned_to IS NULL AND work_orders.status = 'open'))`,
-        );
-      }
-
-      const whereFilters = queryFilters.length > 0
-        ? `AND ${queryFilters.join(' AND ')}`
+    const result = await withTenantContext(tenantId, role, (client) => {
+      const whereFilters = filters.length > 0
+        ? `AND ${filters.join(' AND ')}`
         : '';
 
       return client.query(
-        `SELECT work_orders.*,
-                to_jsonb(assets) AS asset,
-                (assets.id IS NULL AND EXISTS (
+        `SELECT wo.*,
+                a.name AS asset_name,
+                a.code_tag AS asset_code_tag,
+                a.category AS asset_category,
+                COALESCE(tech.name, u.full_name) AS assigned_technician_name,
+                to_jsonb(a) AS asset,
+                (a.id IS NULL AND EXISTS (
                   SELECT 1
                   FROM public.assets AS archived_assets
-                  WHERE archived_assets.id = work_orders.asset_id
-                    AND archived_assets.tenant_id = work_orders.tenant_id
+                  WHERE archived_assets.id = wo.asset_id
+                    AND archived_assets.tenant_id = wo.tenant_id
                     AND archived_assets.deleted_at IS NOT NULL
                 )) AS asset_deleted,
                 to_jsonb(tech) AS technician,
-                usr.full_name AS assigned_to_name,
-                COALESCE(tech.name, usr.full_name, NULL) AS assigned_technician_name
-         FROM public.work_orders AS work_orders
-         INNER JOIN public.assets AS assets
-           ON assets.id = work_orders.asset_id
-           AND assets.tenant_id = work_orders.tenant_id
-           AND assets.deleted_at IS NULL
+                u.full_name AS assigned_to_name
+         FROM public.work_orders AS wo
+         LEFT JOIN public.assets AS a
+           ON a.id = wo.asset_id
+          AND a.tenant_id = wo.tenant_id
          LEFT JOIN public.technicians AS tech
-           ON tech.id = work_orders.assigned_to
-          AND tech.tenant_id = work_orders.tenant_id
+           ON tech.id = wo.assigned_to
+          AND tech.tenant_id = wo.tenant_id
           AND tech.deleted_at IS NULL
-          AND tech.domain = $2
-         LEFT JOIN public.app_users AS usr
-           ON usr.id = work_orders.assigned_to
-          AND usr.tenant_id = work_orders.tenant_id
-         WHERE work_orders.tenant_id = $1
-           AND work_orders.deleted_at IS NULL
-           AND (assets.domain = $2 OR work_orders.domain = $2)
+         LEFT JOIN public.app_users AS u
+           ON u.id = wo.assigned_to
+          AND u.tenant_id = wo.tenant_id
+         WHERE wo.tenant_id = $1
+           AND wo.deleted_at IS NULL
            ${whereFilters}
-         ORDER BY work_orders.created_at DESC`,
-        queryValues,
+         ORDER BY wo.created_at DESC`,
+        values,
       );
     });
 
-    return res.json({
-      workOrders: result.rows.map((workOrder) => ({
-        ...workOrder,
-        assignedTechnicianName: workOrder.assigned_technician_name,
-      })),
+    return res.status(200).json({
+      workOrders: result.rows,
+      total: result.rows.length,
     });
   } catch (error) {
     return next(error);
