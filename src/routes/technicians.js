@@ -18,7 +18,8 @@ router.get('/', requireTenant, async (req, res, next) => {
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT t.id,
+        `SELECT DISTINCT ON (LOWER(COALESCE(t.email, u.email, t.name)))
+                t.id,
                 t.tenant_id,
                 COALESCE(t.name, u.full_name) AS name,
                 COALESCE(t.name, u.full_name) AS full_name,
@@ -32,8 +33,7 @@ router.get('/', requireTenant, async (req, res, next) => {
                 (
                   SELECT COUNT(*)::int
                   FROM public.work_orders AS wo
-                  WHERE wo.tenant_id = t.tenant_id
-                    AND (wo.assigned_to = t.id OR wo.assigned_to = t.user_id)
+                  WHERE (wo.assigned_to = t.id OR wo.assigned_to = t.user_id)
                     AND wo.status IN ('open', 'in_progress', 'waiting_parts', 'paused')
                     AND wo.deleted_at IS NULL
                 ) AS active_orders_count
@@ -44,7 +44,9 @@ router.get('/', requireTenant, async (req, res, next) => {
          WHERE t.tenant_id = $1
            AND t.deleted_at IS NULL
            AND (t.status = 'active' OR t.status IS NULL)
-         ORDER BY name ASC`,
+         ORDER BY LOWER(COALESCE(t.email, u.email, t.name)) ASC,
+                  active_orders_count DESC,
+                  t.created_at DESC`,
         [req.user.tenantId],
       ),
     );
