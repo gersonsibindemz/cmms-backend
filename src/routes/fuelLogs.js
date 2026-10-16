@@ -11,6 +11,61 @@ router.use(authenticateToken, enforceDomainScope, (req, res, next) => {
   return next();
 });
 
+router.get('/reference-prices', async (req, res, next) => {
+  try {
+    const reference = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      const tenantResult = await client.query(
+        `SELECT country, currency
+         FROM public.tenants
+         WHERE id = $1::uuid`,
+        [req.user.tenantId],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return null;
+
+      const pricesResult = await client.query(
+        `SELECT fuel_type, price_per_liter, tenant_id
+         FROM public.fuel_price_settings
+         WHERE tenant_id = $1::uuid
+            OR (
+              tenant_id IS NULL
+              AND country = $2
+              AND currency = $3
+            )
+         ORDER BY (tenant_id = $1::uuid) DESC NULLS LAST`,
+        [req.user.tenantId, tenant.country, tenant.currency],
+      );
+      return { tenant, prices: pricesResult.rows };
+    });
+
+    if (!reference) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+
+    const prices = { diesel: null, gasolina: null };
+    for (const price of reference.prices) {
+      const fuelType = price.fuel_type.trim().toLowerCase();
+      const key = fuelType === 'diesel'
+        ? 'diesel'
+        : ['gasolina', 'gasoline', 'petrol'].includes(fuelType)
+          ? 'gasolina'
+          : null;
+      if (key && prices[key] === null) prices[key] = Number(price.price_per_liter);
+    }
+
+    return res.json({
+      country: reference.tenant.country,
+      currency: reference.tenant.currency,
+      prices: {
+        Diesel: prices.diesel ?? 75.00,
+        Gasolina: prices.gasolina ?? 86.25,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get('/', async (req, res, next) => {
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>

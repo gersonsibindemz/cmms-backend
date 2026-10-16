@@ -18,6 +18,7 @@ router.get('/tenants', async (req, res, next) => {
                 tenants.max_assets_limit,
                 tenants.max_users_limit, tenants.operational_scope,
                 tenants.default_operational_scope,
+                tenants.country, tenants.currency,
                 (SELECT COUNT(*)::int
                  FROM public.assets
                  WHERE tenant_id = tenants.id
@@ -47,6 +48,8 @@ export async function createTenantHandler(req, res, next) {
     maxUsersLimit = 50,
     operationalScope = 'fleet',
     defaultOperationalScope,
+    country = 'Moçambique',
+    currency = 'MZN',
     adminFullName,
     adminEmail,
     adminPassword,
@@ -68,6 +71,11 @@ export async function createTenantHandler(req, res, next) {
     !OPERATIONAL_SCOPES.has(operationalScope) ||
     !['fleet', 'plant'].includes(tenantDefaultScope) ||
     (operationalScope !== 'mixed' && tenantDefaultScope !== operationalScope) ||
+    typeof country !== 'string' ||
+    !country.trim() ||
+    country.trim().length > 100 ||
+    typeof currency !== 'string' ||
+    !/^[A-Za-z]{3}$/.test(currency.trim()) ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail.trim())
   ) {
     return res.status(400).json({ error: 'Dados da empresa ou do administrador inválidos.' });
@@ -79,12 +87,12 @@ export async function createTenantHandler(req, res, next) {
       const tenantResult = await client.query(
         `INSERT INTO public.tenants (
            name, trade_name, nuit, province, max_assets_limit, max_users_limit,
-           operational_scope, default_operational_scope
+           operational_scope, default_operational_scope, country, currency
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id, name, trade_name, nuit, province, is_active,
                    max_assets_limit, max_users_limit, operational_scope,
-                   default_operational_scope`,
+                   default_operational_scope, country, currency`,
         [
           tenantName.trim(),
           tradeName.trim(),
@@ -94,6 +102,8 @@ export async function createTenantHandler(req, res, next) {
           maxUsersLimit,
           operationalScope,
           tenantDefaultScope,
+          country.trim(),
+          currency.trim().toUpperCase(),
         ],
       );
       const tenant = tenantResult.rows[0];
@@ -143,10 +153,22 @@ router.put('/tenants/:id', async (req, res, next) => {
     maxUsersLimit,
     operationalScope,
     defaultOperationalScope,
+    country,
+    currency,
   } = req.body ?? {};
 
   if (operationalScope != null && !OPERATIONAL_SCOPES.has(operationalScope)) {
     return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+  if (
+    (country != null && (
+      typeof country !== 'string' || !country.trim() || country.trim().length > 100
+    )) ||
+    (currency != null && (
+      typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency.trim())
+    ))
+  ) {
+    return res.status(400).json({ error: 'País ou moeda inválidos.' });
   }
 
   try {
@@ -161,8 +183,10 @@ router.put('/tenants/:id', async (req, res, next) => {
              max_users_limit = COALESCE($6, max_users_limit),
              operational_scope = COALESCE($7, operational_scope),
              default_operational_scope = COALESCE($8, default_operational_scope),
+             country = COALESCE($9, country),
+             currency = COALESCE($10, currency),
              updated_at = NOW()
-         WHERE id = $9::uuid
+         WHERE id = $11::uuid
          RETURNING *`,
         [
           name,
@@ -173,6 +197,8 @@ router.put('/tenants/:id', async (req, res, next) => {
           maxUsersLimit,
           operationalScope,
           defaultOperationalScope,
+          country?.trim(),
+          currency?.trim().toUpperCase(),
           req.params.id,
         ],
       ),
