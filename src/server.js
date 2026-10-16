@@ -14,6 +14,7 @@ import notificationRoutes from './routes/notifications.js';
 import maintenanceNotificationsRouter from './routes/maintenanceNotifications.js';
 import partsRoutes from './routes/parts.js';
 import dashboardRoutes from './routes/dashboard.js';
+import maintenancePlansRouter from './routes/maintenancePlans.js';
 
 const app = express();
 
@@ -42,6 +43,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/maintenance-notifications', maintenanceNotificationsRouter);
 app.use('/api/parts', partsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/maintenance-plans', maintenancePlansRouter);
 
 app.use((err, req, res, next) => {
   console.error('[Unhandled Error]:', err);

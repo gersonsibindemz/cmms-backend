@@ -1,5 +1,5 @@
 AUDITORIA TÉCNICA DO BACKEND CMMS
-Data da revisão: 2026-10-15
+Data da revisão: 2026-10-16
 Escopo: código em src/ e migrações SQL versionadas em supabase/migrations/.
 Limitação: revisão estática do repositório; não houve ligação ao PostgreSQL de destino nem execução de testes automatizados.
 
@@ -15,7 +15,7 @@ RESUMO EXECUTIVO
 --------------
 - Runtime: Node.js com ES modules e Express.
 - Entrada: src/server.js; health check: GET /health.
-- Prefixos montados: /api/auth, /api/super-admin, /api/admin, /api/users, /api/assets, /api/fuel, /api/work-orders, /api/technicians, /api/notifications, /api/parts e /api/dashboard.
+- Prefixos montados: /api/auth, /api/super-admin, /api/admin, /api/users, /api/assets, /api/fuel, /api/work-orders, /api/technicians, /api/notifications, /api/maintenance-notifications, /api/parts e /api/dashboard.
 - Middleware global: CORS com credenciais e origem configurada por FRONTEND_URL, express.json(), cookieParser() e handler global de erro.
 - Persistência: pg.Pool configurado com DATABASE_URL e SSL; o código define rejectUnauthorized: false.
 
@@ -23,7 +23,8 @@ RESUMO EXECUTIVO
 -------------------------------------------
 - withTenantContext(tenantId, userRole, callback), em src/db.js, adquire uma ligação, executa BEGIN, define app.current_tenant e app.current_user_role via set_config(..., true), executa a callback e faz COMMIT ou ROLLBACK.
 - As rotas operacionais observadas usam este helper para as operações no banco. A autenticação constitui uma exceção: login e /api/auth/me consultam diretamente o pool, sem contexto tenant.
-- Migrações incluídas criam ou ajustam work_orders, technicians, work_order_events, asset_documents, notifications, parts, work_order_parts, stock_movements e fuel_logs. Também adicionam limites/escalas operacionais, compatibilidade de custos e a coluna assets.province.
+- Migrações incluídas criam ou ajustam work_orders, technicians, work_order_events, asset_documents, notifications, maintenance_notifications, parts, work_order_parts, stock_movements e fuel_logs. Também adicionam limites/escalas operacionais, compatibilidade de custos e a coluna assets.province.
+- A migração 20261016100000_allow_close_work_order_event.sql atualiza a constraint de work_order_events.event_type para aceitar o evento close, além de start, pause, resume, interrupt e complete.
 - As migrações definem RLS para as tabelas operacionais abrangidas, com políticas que usam app.current_tenant e permitem acesso quando app.current_user_role = 'super_admin'.
 - O repositório não contém uma migração de criação do esquema base tenants, app_users e assets. Também não permite confirmar a configuração efetiva de RLS, o proprietário das tabelas, o estado das migrações ou eventuais diferenças no banco de produção.
 
@@ -39,9 +40,9 @@ RESUMO EXECUTIVO
 -----------------------------
 - Ativos: CRUD, documentos, atualização de contador e remoção lógica. Uploads aceitam PDF e imagens JPEG/PNG/WebP, até 20 MiB.
 - Combustível: limitado ao escopo fleet; verifica tenant, domínio do ativo, capacidade do tanque quando definida e não diminuição do contador.
-- Ordens de serviço: valida tipos, estados, perfis e transições; regista eventos e associa peças à ordem.
+- Ordens de serviço: valida tipos, estados, perfis e transições; regista eventos e associa peças à ordem. As transições complete e close concluem a ordem e repõem o ativo como operational; a migração mais recente permite persistir o evento close na constraint da tabela.
 - Peças/stock: inclui criação, reposição e retirada, com registo em stock_movements.
-- Notificações: filtradas por tenant, domínio, utilizador e/ou perfil.
+- Notificações e notificações de manutenção: rotas separadas, filtradas por tenant, domínio, utilizador e/ou perfil; a migração de maintenance_notifications inclui RLS e índices por tenant/domínio, estado e ativo.
 - Técnicos e dashboard: rotas operacionais com autenticação, escopo e consultas por tenant.
 - As tabelas operacionais mencionadas têm suporte em migrações versionadas; a verificação de compatibilidade final depende de executar as migrações contra o esquema real.
 
@@ -103,4 +104,4 @@ H. Reconciliação de stock sem mecanismo automático no banco
 ------------
 O backend tem uma base modular e um padrão útil de contexto tenant transacional, com middleware de escopo aplicado às principais rotas operacionais e migrações para várias tabelas e políticas RLS. A auditoria estática não confirma o estado efetivo do banco de produção. As prioridades são verificar esse contrato de banco, fechar a janela de revogação de tokens, validar TLS, tornar atómico o limite de ativos e reduzir a exposição de erros internos.
 
-Este ficheiro foi atualizado em 2026-10-15 com base no código e nas migrações versionadas no repositório.
+Este ficheiro foi atualizado em 2026-10-16 com base no código e nas migrações versionadas no repositório.
