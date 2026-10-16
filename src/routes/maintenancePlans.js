@@ -70,6 +70,12 @@ function validatePlanFields(plan) {
       || plan.assigned_technician_id === null
       || (typeof plan.assigned_technician_id === 'string'
         && UUID_PATTERN.test(plan.assigned_technician_id))
+    )
+    && (
+      plan.plan_code === undefined
+      || plan.plan_code === null
+      || (typeof plan.plan_code === 'string'
+        && /^PLN-[A-Za-z0-9-]{1,20}$/.test(plan.plan_code.trim()))
     );
 }
 
@@ -114,26 +120,26 @@ router.get('/', requireTenant, async (req, res, next) => {
   try {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT plans.*,
-                assets.name AS asset_name,
-                assets.code_tag AS asset_code,
-                COALESCE(technicians.name, assigned_users.full_name) AS assigned_technician_name
-         FROM public.maintenance_plans AS plans
-         LEFT JOIN public.assets AS assets
-           ON assets.id = plans.asset_id
-          AND assets.tenant_id = plans.tenant_id
-          AND assets.deleted_at IS NULL
-         LEFT JOIN public.technicians AS technicians
-           ON technicians.id = plans.assigned_technician_id
-          AND technicians.tenant_id = plans.tenant_id
-          AND technicians.deleted_at IS NULL
-         LEFT JOIN public.app_users AS assigned_users
-           ON assigned_users.id = plans.assigned_technician_id
-          AND assigned_users.tenant_id = plans.tenant_id
-         WHERE plans.tenant_id = $1::uuid
-           AND plans.deleted_at IS NULL
-           AND ($2 = 'all' OR plans.domain = $2)
-         ORDER BY plans.created_at DESC`,
+        `SELECT p.*,
+                a.name AS asset_name,
+                a.code_tag AS asset_code,
+                a.current_meter AS asset_current_meter,
+                COALESCE(u.full_name, t.name) AS technician_name
+         FROM public.maintenance_plans AS p
+         LEFT JOIN public.assets AS a
+           ON a.id = p.asset_id
+          AND a.tenant_id = p.tenant_id
+         LEFT JOIN public.app_users AS u
+           ON u.id = p.assigned_technician_id
+          AND u.tenant_id = p.tenant_id
+         LEFT JOIN public.technicians AS t
+           ON t.id = p.assigned_technician_id
+          AND t.tenant_id = p.tenant_id
+          AND t.deleted_at IS NULL
+         WHERE p.tenant_id = $1::uuid
+           AND p.deleted_at IS NULL
+           AND ($2 = 'all' OR p.domain = $2)
+         ORDER BY p.created_at DESC`,
         [req.user.tenantId, req.userScope],
       ),
     );
@@ -149,7 +155,12 @@ router.post(
   requireRoles(...PLAN_MANAGERS),
   async (req, res, next) => {
     const plan = req.body ?? {};
-    if (!validatePlanFields(plan)) {
+    const requestedPlanCode = plan.plan_code ?? plan.code;
+    const planCode = typeof requestedPlanCode === 'string'
+      && requestedPlanCode.trim() === ''
+      ? null
+      : requestedPlanCode ?? null;
+    if (!validatePlanFields({ ...plan, plan_code: planCode })) {
       return res.status(400).json({ error: 'Dados do plano de manutenção inválidos.' });
     }
 
@@ -162,20 +173,26 @@ router.post(
         }
         const result = await client.query(
           `INSERT INTO public.maintenance_plans (
-             tenant_id, asset_id, domain, title, trigger_type, interval_days,
+             tenant_id, plan_code, asset_id, domain, title, trigger_type, interval_days,
              interval_meter, checklist_items, assigned_technician_id,
              next_due_at, next_due_meter
            )
            VALUES (
-             $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb, $9::uuid,
-             CASE WHEN $5 IN ('time', 'both')
-               THEN CURRENT_DATE + $6::integer ELSE NULL END,
-             CASE WHEN $5 IN ('meter', 'both')
-               THEN COALESCE($10::numeric, 0) + $7::numeric ELSE NULL END
+             $1::uuid,
+             COALESCE(
+               $2,
+               'PLN-' || to_char(nextval('public.maintenance_plan_code_seq'), 'FM000')
+             ),
+             $3::uuid, $4, $5, $6, $7, $8, $9::jsonb, $10::uuid,
+             CASE WHEN $6 IN ('time', 'both')
+               THEN CURRENT_DATE + $7::integer ELSE NULL END,
+             CASE WHEN $6 IN ('meter', 'both')
+               THEN COALESCE($11::numeric, 0) + $8::numeric ELSE NULL END
            )
            RETURNING *`,
           [
             req.user.tenantId,
+            planCode?.trim() || null,
             asset.id,
             asset.domain,
             plan.title.trim(),

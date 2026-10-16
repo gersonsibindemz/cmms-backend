@@ -16,26 +16,44 @@ function requireTenant(req, res, next) {
 
 router.get('/', requireTenant, async (req, res, next) => {
   try {
-    const values = [req.user.tenantId];
-    const scopeClause = req.userScope ? 'AND t.domain = $2' : '';
-    if (req.userScope) values.push(req.userScope);
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `SELECT t.*, COALESCE(u.email, t.email) AS user_email
+        `SELECT t.id,
+                t.tenant_id,
+                COALESCE(t.name, u.full_name) AS name,
+                COALESCE(t.name, u.full_name) AS full_name,
+                COALESCE(t.email, u.email) AS email,
+                COALESCE(t.phone, u.phone) AS phone,
+                COALESCE(t.specialty, 'Mecânico Auto') AS specialty,
+                COALESCE(t.operational_scope, u.operational_scope, 'fleet') AS operational_scope,
+                COALESCE(t.status, 'active') AS status,
+                t.hourly_rate,
+                t.user_id,
+                (
+                  SELECT COUNT(*)::int
+                  FROM public.work_orders AS wo
+                  WHERE wo.tenant_id = t.tenant_id
+                    AND (wo.assigned_to = t.id OR wo.assigned_to = t.user_id)
+                    AND wo.status IN ('open', 'in_progress', 'waiting_parts', 'paused')
+                    AND wo.deleted_at IS NULL
+                ) AS active_orders_count
          FROM public.technicians AS t
          LEFT JOIN public.app_users AS u
-           ON u.id = t.user_id
+           ON (u.id = t.user_id OR u.id = t.id)
           AND u.tenant_id = t.tenant_id
          WHERE t.tenant_id = $1
            AND t.deleted_at IS NULL
-           AND t.status = 'active'
-           ${scopeClause}
-         ORDER BY t.name ASC`,
-        values,
+           AND (t.status = 'active' OR t.status IS NULL)
+           AND (t.domain = $2 OR t.operational_scope = $2)
+         ORDER BY name ASC`,
+        [req.user.tenantId, req.userScope],
       ),
     );
 
-    return res.json({ technicians: result.rows });
+    return res.status(200).json({
+      technicians: result.rows,
+      total: result.rows.length,
+    });
   } catch (error) {
     return next(error);
   }
@@ -85,9 +103,10 @@ router.post('/', requireTenant, async (req, res, next) => {
 
       const result = await client.query(
         `INSERT INTO public.technicians (
-           tenant_id, name, specialty, phone, email, hourly_rate, user_id, domain
+           tenant_id, name, specialty, phone, email, hourly_rate, user_id, domain,
+           operational_scope
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
          RETURNING *`,
         [
           req.user.tenantId,
@@ -100,7 +119,14 @@ router.post('/', requireTenant, async (req, res, next) => {
           technicianDomain,
         ],
       );
-      return { technician: result.rows[0] };
+      return {
+        technician: {
+          ...result.rows[0],
+          id: result.rows[0].id,
+          name: result.rows[0].name,
+          full_name: result.rows[0].name,
+        },
+      };
     });
 
     if (outcome.invalidUser) {
