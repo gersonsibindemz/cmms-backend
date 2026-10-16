@@ -1,8 +1,4 @@
-import { EventEmitter } from 'events';
 import { pool } from '../db.js';
-
-export const notificationBus = new EventEmitter();
-notificationBus.setMaxListeners(100);
 
 export async function createAndDispatchNotification({
   tenantId,
@@ -31,9 +27,7 @@ export async function createAndDispatchNotification({
       link ?? null,
     ],
   );
-  const savedNotification = result.rows[0];
-  notificationBus.emit('new_notification', savedNotification);
-  return savedNotification;
+  return result.rows[0];
 }
 
 export async function notifyWorkOrderAssigned(wo, technicianUserId, asset, client) {

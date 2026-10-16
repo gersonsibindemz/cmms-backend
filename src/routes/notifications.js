@@ -1,105 +1,13 @@
 import { Router } from 'express';
-import jwt from 'jsonwebtoken';
 import { withTenantContext } from '../db.js';
 import {
   authenticateToken,
   enforceDomainScope,
 } from '../middlewares/auth.js';
-import { createAndDispatchNotification, notificationBus } from '../services/notificationService.js';
+import { createAndDispatchNotification } from '../services/notificationService.js';
 
 const router = Router();
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
-const USER_ROLES = new Set([
-  'super_admin',
-  'tenant_admin',
-  'supervisor',
-  'technician',
-  'driver_operator',
-]);
-
-router.get('/stream', (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const token = req.query.token
-    || (typeof authHeader === 'string' ? authHeader.split(' ')[1] : null)
-    || req.cookies?.auth_token;
-  if (typeof token !== 'string' || !token) {
-    return res.status(401).json({ error: 'Autenticação necessária.' });
-  }
-
-  let payload;
-  try {
-    payload = jwt.verify(token, process.env.JWT_SECRET);
-  } catch {
-    return res.status(401).json({ error: 'Token inválido ou expirado.' });
-  }
-
-  const userId = payload && typeof payload === 'object'
-    ? payload.id ?? payload.userId
-    : null;
-  if (
-    !payload ||
-    typeof payload !== 'object' ||
-    !USER_ROLES.has(payload.role) ||
-    typeof userId !== 'string' ||
-    !UUID_PATTERN.test(userId) ||
-    typeof payload.tenantId !== 'string' ||
-    !UUID_PATTERN.test(payload.tenantId)
-  ) {
-    return res.status(401).json({ error: 'Token inválido ou expirado.' });
-  }
-
-  req.user = {
-    id: userId,
-    tenantId: payload.tenantId,
-    role: payload.role,
-    fullName: payload.fullName,
-    operational_scope: payload.operational_scope,
-  };
-  req.userScope = req.user.operational_scope || 'fleet';
-
-  return enforceDomainScope(req, res, () => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-    res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
-
-    const keepAlive = setInterval(() => {
-      res.write(': heartbeat\n\n');
-    }, 25000);
-
-    const listener = (notification) => {
-      if (
-        String(notification.tenant_id) !== String(req.user.tenantId) ||
-        notification.domain !== req.userScope
-      ) {
-        return;
-      }
-
-      const matchesUser = notification.user_id
-        && String(notification.user_id) === String(req.user.id);
-      const matchesRole = notification.target_role
-        && (
-          notification.target_role === req.user.role ||
-          (req.user.role === 'tenant_admin' && notification.target_role === 'supervisor')
-        );
-      const isGlobalTenant = !notification.user_id && !notification.target_role;
-
-      if (matchesUser || matchesRole || isGlobalTenant) {
-        res.write(`data: ${JSON.stringify({ type: 'NOTIFICATION', notification })}\n\n`);
-      }
-    };
-    const cleanup = () => {
-      clearInterval(keepAlive);
-      notificationBus.removeListener('new_notification', listener);
-    };
-
-    notificationBus.on('new_notification', listener);
-    req.on('close', cleanup);
-    res.on('close', cleanup);
-  });
-});
 
 router.use(authenticateToken, enforceDomainScope);
 

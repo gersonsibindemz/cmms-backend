@@ -211,7 +211,16 @@ router.get('/', requireTenant, async (req, res, next) => {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `SELECT notifications.*,
-                to_jsonb(assets) AS asset
+                jsonb_build_object(
+                  'id', assets.id,
+                  'code_tag', assets.code_tag,
+                  'name', assets.name,
+                  'category', assets.category,
+                  'brand', assets.brand,
+                  'model', assets.model,
+                  'domain', assets.domain,
+                  'status', assets.status
+                ) AS asset
          FROM public.maintenance_notifications AS notifications
          JOIN public.assets AS assets
            ON assets.id = notifications.asset_id
@@ -236,7 +245,16 @@ router.get('/:id', requireTenant, async (req, res, next) => {
     const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
         `SELECT notifications.*,
-                to_jsonb(assets) AS asset
+                jsonb_build_object(
+                  'id', assets.id,
+                  'code_tag', assets.code_tag,
+                  'name', assets.name,
+                  'category', assets.category,
+                  'brand', assets.brand,
+                  'model', assets.model,
+                  'domain', assets.domain,
+                  'status', assets.status
+                ) AS asset
          FROM public.maintenance_notifications AS notifications
          JOIN public.assets AS assets
            ON assets.id = notifications.asset_id
@@ -369,6 +387,19 @@ router.post(
             technicianUserId,
             assetResult.rows[0] ?? null,
             client,
+          );
+        }
+
+        if (notification.operational_status === 'stopped_unavailable') {
+          await client.query(
+            `UPDATE public.assets
+             SET status = 'under_maintenance',
+                 updated_at = NOW()
+             WHERE id = $1::uuid
+               AND tenant_id = $2::uuid
+               AND domain = $3
+               AND deleted_at IS NULL`,
+            [notification.asset_id, notification.tenant_id, notification.domain],
           );
         }
 

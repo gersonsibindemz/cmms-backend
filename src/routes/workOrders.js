@@ -409,6 +409,7 @@ async function handleWorkOrderTransition(req, res, next) {
     resume: { status: 'in_progress', allowedFrom: ['waiting_parts', 'blocked'] },
     interrupt: { status: 'blocked', allowedFrom: ['in_progress'] },
     complete: { status: 'completed', allowedFrom: ['in_progress', 'waiting_parts', 'blocked'] },
+    close: { status: 'completed', allowedFrom: ['in_progress', 'waiting_parts', 'blocked'] },
   }[eventType];
 
   if (!transition) {
@@ -439,7 +440,7 @@ async function handleWorkOrderTransition(req, res, next) {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const orderResult = await client.query(
-        `SELECT id, status, assigned_to
+        `SELECT id, asset_id, status, assigned_to
          FROM public.work_orders
          WHERE id = $1
            AND tenant_id = $2
@@ -501,6 +502,21 @@ async function handleWorkOrderTransition(req, res, next) {
           ...(req.userScope ? [req.userScope] : []),
         ],
       );
+
+      if (eventType === 'close' || eventType === 'complete') {
+        await client.query(
+          `UPDATE public.assets
+           SET status = 'operational',
+               updated_at = NOW()
+           WHERE id = $1
+             AND tenant_id = $2
+             AND deleted_at IS NULL
+             ${req.userScope ? 'AND domain = $3' : ''}`,
+          req.userScope
+            ? [order.asset_id, req.user.tenantId, req.userScope]
+            : [order.asset_id, req.user.tenantId],
+        );
+      }
 
       await client.query(
         `INSERT INTO public.work_order_events (
@@ -642,7 +658,7 @@ router.post('/', requireTenant, async (req, res, next) => {
   try {
     const outcome = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
       const assetResult = await client.query(
-        `SELECT id, domain, name
+        `SELECT id, domain, name, status
          FROM public.assets
          WHERE id = $1
            AND tenant_id = $2
@@ -661,10 +677,11 @@ router.post('/', requireTenant, async (req, res, next) => {
         }
       }
 
-      if (orderType === 'corrective') {
+      if (orderType === 'corrective' && assetResult.rows[0].status === 'breakdown') {
         await client.query(
           `UPDATE public.assets
-           SET status = 'breakdown'
+           SET status = 'under_maintenance',
+               updated_at = NOW()
            WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
           [assetId, req.user.tenantId],
         );
@@ -1289,7 +1306,8 @@ async function closeWorkOrder(req, res, next) {
 
       await client.query(
         `UPDATE public.assets
-         SET status = 'operational'
+         SET status = 'operational',
+             updated_at = NOW()
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
            ${req.userScope ? 'AND domain = $3' : ''}`,
         req.userScope
