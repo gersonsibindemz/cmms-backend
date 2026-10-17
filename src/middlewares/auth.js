@@ -101,48 +101,64 @@ export function requireRoles(...allowedRoles) {
   return requireRole(allowedRoles);
 }
 
-export function enforceDomainScope(req, res, next) {
-  if (!USER_ROLES.has(req.user.role)) {
-    return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
+export function enforceDomainScope(requiredScope, res, next) {
+  if (requiredScope && typeof requiredScope === 'object' && res && next) {
+    return createDomainScopeMiddleware()(requiredScope, res, next);
   }
-  if (req.user.role === 'super_admin') return next();
-
-  if (!req.user.tenantId) {
-    return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
-  }
-  if (!DOMAIN_SCOPES.has(req.userScope)) {
-    return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
+  if (requiredScope !== undefined && !DOMAIN_SCOPES.has(requiredScope)) {
+    throw new TypeError(`Escopo operacional desconhecido: ${requiredScope}`);
   }
 
-  const requestedScope = req.query.domain
-    ?? req.query.operational_scope
-    ?? req.get('x-operational-scope')
-    ?? req.get('x-domain');
-  if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
-    return res.status(400).json({ error: 'Escopo operacional inválido.' });
-  }
-  if (requestedScope !== undefined && requestedScope !== req.userScope) {
-    return res.status(403).json({ error: 'O escopo solicitado não corresponde ao utilizador.' });
-  }
+  return createDomainScopeMiddleware(requiredScope);
+}
 
-  withTenantContext(req.user.tenantId, req.user.role, (client) =>
-    client.query(
-      `SELECT operational_scope, default_operational_scope
-       FROM public.tenants
-       WHERE id = $1::uuid`,
-      [req.user.tenantId],
-    ),
-  ).then((result) => {
-    const tenantScope = result.rows[0]?.operational_scope;
-    if (!tenantScope) {
-      return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
+function createDomainScopeMiddleware(requiredScope) {
+  return (req, res, next) => {
+    if (!USER_ROLES.has(req.user.role)) {
+      return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
+    }
+    if (requiredScope && req.userScope !== requiredScope) {
+      return res.status(403).json({ error: 'O módulo não está disponível neste escopo operacional.' });
+    }
+    if (req.user.role === 'super_admin') return next();
+
+    if (!req.user.tenantId) {
+      return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+    }
+    if (!DOMAIN_SCOPES.has(req.userScope)) {
+      return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
     }
 
-    if (tenantScope !== 'mixed' && req.userScope !== tenantScope) {
-      return res.status(403).json({ error: 'O escopo do utilizador não está disponível neste tenant.' });
+    const requestedScope = req.query.domain
+      ?? req.query.operational_scope
+      ?? req.get('x-operational-scope')
+      ?? req.get('x-domain');
+    if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
+      return res.status(400).json({ error: 'Escopo operacional inválido.' });
     }
-    return next();
-  }).catch(next);
+    if (requestedScope !== undefined && requestedScope !== req.userScope) {
+      return res.status(403).json({ error: 'O escopo solicitado não corresponde ao utilizador.' });
+    }
+
+    withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT operational_scope, default_operational_scope
+         FROM public.tenants
+         WHERE id = $1::uuid`,
+        [req.user.tenantId],
+      ),
+    ).then((result) => {
+      const tenantScope = result.rows[0]?.operational_scope;
+      if (!tenantScope) {
+        return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
+      }
+
+      if (tenantScope !== 'mixed' && req.userScope !== tenantScope) {
+        return res.status(403).json({ error: 'O escopo do utilizador não está disponível neste tenant.' });
+      }
+      return next();
+    }).catch(next);
+  };
 }
 
 export function checkTenantLimits(limitType) {
