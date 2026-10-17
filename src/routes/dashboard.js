@@ -64,7 +64,7 @@ async function getDashboard(req, res, next) {
              COUNT(*)::int AS total,
              COUNT(*) FILTER (WHERE status = 'operational')::int AS operational,
              COUNT(*) FILTER (
-               WHERE status IN ('in_maintenance', 'under_maintenance')
+               WHERE status = 'maintenance'
              )::int AS maintenance,
              COUNT(*) FILTER (WHERE status IN ('breakdown', 'inactive'))::int AS breakdown
            FROM public.assets
