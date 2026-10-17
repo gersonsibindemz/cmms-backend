@@ -35,13 +35,11 @@ router.get('/reference-prices', async (req, res, next) => {
       const pricesResult = await client.query(
         `SELECT fuel_type, price_per_liter, tenant_id
          FROM public.fuel_price_settings
-         WHERE tenant_id = $1::uuid
-            OR (
-              tenant_id IS NULL
-              AND country = $2
-              AND currency = $3
-            )
-         ORDER BY (tenant_id = $1::uuid) DESC NULLS LAST`,
+         WHERE country = $2
+           AND currency = $3
+           AND (tenant_id = $1::uuid OR tenant_id IS NULL)
+         ORDER BY (tenant_id = $1::uuid) DESC NULLS LAST,
+                  updated_at DESC`,
         [req.user.tenantId, tenant.country, tenant.currency],
       );
       return { tenant, prices: pricesResult.rows };
@@ -66,6 +64,7 @@ router.get('/reference-prices', async (req, res, next) => {
       country: reference.tenant.country,
       currency: reference.tenant.currency,
       prices: {
+        // Keep system defaults only for fuel types without a configured price.
         Diesel: prices.diesel ?? 75.00,
         Gasolina: prices.gasolina ?? 86.25,
       },

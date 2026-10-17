@@ -76,7 +76,13 @@ router.post('/fuel-prices', async (req, res, next) => {
     tenantId = null,
     fuelType,
     pricePerLiter,
+    diesel_price: dieselPrice,
+    dieselPrice: dieselPriceCamel,
+    gasoline_price: gasolinePrice,
+    gasolinePrice: gasolinePriceCamel,
   } = req.body ?? {};
+  const requestedDieselPrice = dieselPrice ?? dieselPriceCamel;
+  const requestedGasolinePrice = gasolinePrice ?? gasolinePriceCamel;
 
   if (
     typeof country !== 'string' ||
@@ -88,37 +94,72 @@ router.post('/fuel-prices', async (req, res, next) => {
       typeof tenantId !== 'string' ||
       !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(tenantId)
     )) ||
-    typeof fuelType !== 'string' ||
-    !fuelType.trim() ||
-    fuelType.trim().length > 100 ||
-    typeof pricePerLiter !== 'number' ||
-    !Number.isFinite(pricePerLiter) ||
-    pricePerLiter < 0
+    (
+      fuelType !== undefined
+      && (
+        typeof fuelType !== 'string'
+        || !fuelType.trim()
+        || fuelType.trim().length > 100
+        || typeof pricePerLiter !== 'number'
+        || !Number.isFinite(pricePerLiter)
+        || pricePerLiter < 0
+      )
+    ) ||
+    (
+      (requestedDieselPrice !== undefined || requestedGasolinePrice !== undefined)
+      && (
+        typeof requestedDieselPrice !== 'number'
+        || !Number.isFinite(requestedDieselPrice)
+        || requestedDieselPrice < 0
+        || typeof requestedGasolinePrice !== 'number'
+        || !Number.isFinite(requestedGasolinePrice)
+        || requestedGasolinePrice < 0
+      )
+    ) ||
+    (
+      fuelType === undefined
+      && requestedDieselPrice === undefined
+      && requestedGasolinePrice === undefined
+    )
   ) {
     return res.status(400).json({ error: 'Dados do preço de combustível inválidos.' });
   }
 
   try {
-    const result = await withTenantContext(null, 'super_admin', (client) =>
-      client.query(
-        `INSERT INTO public.fuel_price_settings (
-           country, currency, tenant_id, fuel_type, price_per_liter
-         )
-         VALUES ($1, $2, $3::uuid, $4, $5)
-         ON CONFLICT (country, currency, tenant_id, fuel_type)
-         DO UPDATE SET price_per_liter = EXCLUDED.price_per_liter,
-                       updated_at = NOW()
-         RETURNING *`,
-        [
-          country.trim(),
-          currency.trim().toUpperCase(),
-          tenantId,
-          fuelType.trim(),
-          pricePerLiter,
-        ],
-      ),
-    );
-    return res.status(200).json({ fuelPrice: result.rows[0] });
+    const singlePrice = fuelType !== undefined;
+    const pricesToSave = singlePrice
+      ? [{ fuelType: fuelType.trim(), price: pricePerLiter }]
+      : [
+        { fuelType: 'Diesel', price: requestedDieselPrice },
+        { fuelType: 'Gasolina', price: requestedGasolinePrice },
+      ];
+    const fuelPrices = await withTenantContext(null, 'super_admin', async (client) => {
+      const savedPrices = [];
+      for (const item of pricesToSave) {
+        const result = await client.query(
+          `INSERT INTO public.fuel_price_settings (
+             country, currency, tenant_id, fuel_type, price_per_liter
+           )
+           VALUES ($1, $2, $3::uuid, $4, $5)
+           ON CONFLICT ON CONSTRAINT fuel_price_settings_scope_unique
+           DO UPDATE SET price_per_liter = EXCLUDED.price_per_liter,
+                         updated_at = NOW()
+           RETURNING *`,
+          [
+            country.trim(),
+            currency.trim().toUpperCase(),
+            tenantId,
+            item.fuelType,
+            item.price,
+          ],
+        );
+        savedPrices.push(result.rows[0]);
+      }
+      return savedPrices;
+    });
+    return res.status(200).json(singlePrice
+      ? { fuelPrice: fuelPrices[0] }
+      : { fuelPrices });
   } catch (error) {
     return next(error);
   }
