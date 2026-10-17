@@ -16,6 +16,30 @@ import {
 
 const router = express.Router();
 const emptyToNull = (value) => (typeof value === 'string' && value.trim() === '' ? null : value);
+const ASSET_CATEGORIES = new Set([
+  'vehicle_light',
+  'vehicle_heavy',
+  'machinery',
+  'plant_equipment',
+  'generator',
+]);
+const ASSET_CATEGORY_CODES = new Map([
+  ['CAT-01', 'vehicle_light'],
+  ['CAT-02', 'vehicle_heavy'],
+  ['CAT-03', 'machinery'],
+  ['CAT-04', 'plant_equipment'],
+  ['CAT-05', 'generator'],
+]);
+const INVALID_ASSET_CATEGORY_ERROR =
+  'Categoria inválida. Use uma categoria válida ou um código CAT-01 a CAT-05.';
+
+function normalizeAssetCategory(value) {
+  if (typeof value !== 'string') return null;
+  const category = value.trim();
+  const normalizedCategory = ASSET_CATEGORY_CODES.get(category.toUpperCase()) ?? category;
+  return ASSET_CATEGORIES.has(normalizedCategory) ? normalizedCategory : null;
+}
+
 const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
 const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
   'application/pdf',
@@ -430,6 +454,10 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
           ) {
             throw new Error('Nome e categoria são obrigatórios.');
           }
+          const category = normalizeAssetCategory(item.category);
+          if (!category) {
+            throw new Error(INVALID_ASSET_CATEGORY_ERROR);
+          }
 
           const codeTagValue = item.codeTag ?? item.code_tag;
           if (
@@ -473,7 +501,7 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
           if (!finalCodeTag) {
             const codeResult = await client.query(
               'SELECT public.fn_generate_asset_code($1::uuid, $2::varchar) AS generated_code',
-              [tenantId, item.category.trim()],
+              [tenantId, category],
             );
             finalCodeTag = codeResult.rows[0]?.generated_code;
             if (typeof finalCodeTag !== 'string' || !finalCodeTag) {
@@ -499,7 +527,7 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
               userScope,
               item.name.trim(),
               finalCodeTag,
-              item.category.trim(),
+              category,
               item.brand ?? null,
               item.model ?? null,
               item.manufactureYear ?? item.manufacture_year ?? null,
@@ -553,7 +581,7 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
 router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) => {
   try {
     const {
-      codeTag, name, category, criticalityLevel, brand, model, manufactureYear,
+      codeTag, name, category: requestedCategory, criticalityLevel, brand, model, manufactureYear,
       currentMeter, meterKind, costCenter, province,
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
@@ -570,10 +598,11 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
     const energyType = energyTypeSnake ?? requestedEnergyType;
     const ownershipType = ownershipTypeSnake ?? requestedOwnershipType;
     const axleConfig = axleConfigSnake ?? requestedAxleConfig;
+    const category = normalizeAssetCategory(requestedCategory);
 
     if (
       typeof name !== 'string' || !name.trim()
-      || typeof category !== 'string' || !category.trim()
+      || !category
       || [assetType, assetSubtype, energyType, ownershipType].some(
         (value) => value !== undefined && value !== null
           && (typeof value !== 'string' || value.length > 255),
@@ -581,6 +610,9 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
       || (axleConfig !== undefined && axleConfig !== null
         && (!Number.isInteger(axleConfig) || axleConfig < 1))
     ) {
+      if (typeof name === 'string' && name.trim() && !category) {
+        return res.status(400).json({ error: INVALID_ASSET_CATEGORY_ERROR });
+      }
       return res.status(400).json({ error: 'Dados do ativo inválidos.' });
     }
 
