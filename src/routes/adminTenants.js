@@ -39,35 +39,55 @@ router.get('/tenants', async (req, res, next) => {
 });
 
 export async function createTenantHandler(req, res, next) {
-  const {
-    tenantName,
-    tradeName,
-    nuit,
-    province,
-    maxAssetsLimit,
-    maxUsersLimit = 50,
-    operationalScope = 'fleet',
-    defaultOperationalScope,
-    country = 'Moçambique',
-    currency = 'MZN',
-    adminFullName,
-    adminEmail,
-    adminPassword,
-    adminPhone,
-  } = req.body ?? {};
+  const body = req.body ?? {};
+  const safeBody = Object.fromEntries(
+    Object.entries(body).filter(([key]) => !/password/i.test(key)),
+  );
+  console.log('Dados recebidos no tenant POST:', safeBody);
+
+  const companyName = body.name;
+  const tradeName = body.trade_name || body.tradeName;
+  const nuit = body.nuit;
+  const province = body.province;
+  const country = body.country || 'Moçambique';
+  const currency = body.currency || 'MZN';
+  const operationalScope = body.operational_scope || body.operationalScope || 'fleet';
+  const maxAssets = body.max_assets_limit || body.maxAssetsLimit || body.maxAssets || 10;
+  const maxUsers = body.max_users_limit || body.maxUsersLimit || body.maxUsers || 5;
+
+  const adminName = body.adminFullName || body.admin_full_name || body.adminName;
+  const adminPhone = body.adminPhone || body.admin_phone;
+  const adminEmail = body.adminEmail || body.admin_email;
+  const adminPassword = body.adminPassword || body.admin_password;
+  const defaultOperationalScope = body.defaultOperationalScope;
   const tenantDefaultScope = defaultOperationalScope
     ?? (operationalScope === 'plant' ? 'plant' : 'fleet');
   const adminOperationalScope = operationalScope === 'mixed'
     ? tenantDefaultScope
     : operationalScope;
 
+  const requiredFields = [
+    ['name', companyName],
+    ['trade_name', tradeName],
+    ['nuit', nuit],
+    ['province', province],
+    ['nome do administrador', adminName],
+    ['email do administrador', adminEmail],
+    ['password do administrador', adminPassword],
+    ['telefone do administrador', adminPhone],
+  ];
+  const missingField = requiredFields.find(
+    ([, value]) => typeof value !== 'string' || !value.trim(),
+  );
+  if (missingField) {
+    return res.status(400).json({ error: `O campo obrigatório "${missingField[0]}" está em falta.` });
+  }
+
   if (
-    [tenantName, tradeName, nuit, province, adminFullName, adminEmail, adminPassword, adminPhone]
-      .some((value) => typeof value !== 'string' || !value.trim()) ||
-    !Number.isInteger(maxAssetsLimit) ||
-    maxAssetsLimit < 0 ||
-    !Number.isInteger(maxUsersLimit) ||
-    maxUsersLimit < 1 ||
+    !Number.isInteger(maxAssets) ||
+    maxAssets < 0 ||
+    !Number.isInteger(maxUsers) ||
+    maxUsers < 1 ||
     !OPERATIONAL_SCOPES.has(operationalScope) ||
     !['fleet', 'plant'].includes(tenantDefaultScope) ||
     (operationalScope !== 'mixed' && tenantDefaultScope !== operationalScope) ||
@@ -78,7 +98,7 @@ export async function createTenantHandler(req, res, next) {
     !/^[A-Za-z]{3}$/.test(currency.trim()) ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail.trim())
   ) {
-    return res.status(400).json({ error: 'Dados da empresa ou do administrador inválidos.' });
+    return res.status(400).json({ error: 'Um ou mais campos da empresa ou do administrador são inválidos.' });
   }
 
   try {
@@ -94,12 +114,12 @@ export async function createTenantHandler(req, res, next) {
                    max_assets_limit, max_users_limit, operational_scope,
                    default_operational_scope, country, currency`,
         [
-          tenantName.trim(),
+          companyName.trim(),
           tradeName.trim(),
           nuit.trim(),
           province.trim(),
-          maxAssetsLimit,
-          maxUsersLimit,
+          maxAssets,
+          maxUsers,
           operationalScope,
           tenantDefaultScope,
           country.trim(),
@@ -119,7 +139,7 @@ export async function createTenantHandler(req, res, next) {
           tenant.id,
           adminEmail.trim().toLowerCase(),
           passwordHash,
-          adminFullName.trim(),
+          adminName.trim(),
           adminPhone.trim(),
           'tenant_admin',
           adminOperationalScope,
