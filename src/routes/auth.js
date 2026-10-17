@@ -1,10 +1,74 @@
 import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { pool } from '../db.js';
+import multer from 'multer';
+import { pool, withTenantContext } from '../db.js';
+import { authenticateToken } from '../middlewares/auth.js';
+import { removeUserAvatar, uploadUserAvatar } from '../services/storage.js';
 
 const router = Router();
 const IS_PROD = process.env.NODE_ENV === 'production';
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter(req, file, callback) {
+    if (['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
+      return callback(null, true);
+    }
+    const error = new Error('Formato da foto de perfil inválido. Use JPEG, PNG ou WebP.');
+    error.code = 'UNSUPPORTED_AVATAR_TYPE';
+    return callback(error);
+  },
+});
+
+function parseAvatarUpload(req, res, next) {
+  avatarUpload.single('avatar')(req, res, (error) => {
+    if (!error) return next();
+    if (error instanceof multer.MulterError) {
+      return res.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400)
+        .json({ error: error.message });
+    }
+    if (error.code === 'UNSUPPORTED_AVATAR_TYPE') {
+      return res.status(415).json({ error: error.message });
+    }
+    return next(error);
+  });
+}
+
+router.post('/me/avatar', authenticateToken, parseAvatarUpload, async (req, res, next) => {
+  if (!req.file || req.file.size === 0) {
+    return res.status(400).json({ error: 'Envie uma foto no campo "avatar".' });
+  }
+
+  let uploadedAvatar;
+  try {
+    uploadedAvatar = await uploadUserAvatar(req.user.id, req.file.buffer, req.file.mimetype);
+    const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        `UPDATE public.app_users
+         SET avatar_url = $1
+         WHERE id = $2::uuid
+           AND deleted_at IS NULL
+         RETURNING avatar_url`,
+        [uploadedAvatar.publicUrl, req.user.id],
+      ),
+    );
+    if (!result.rowCount) {
+      await removeUserAvatar(uploadedAvatar.storagePath);
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+    return res.json({ avatar_url: result.rows[0].avatar_url });
+  } catch (error) {
+    if (uploadedAvatar) {
+      try {
+        await removeUserAvatar(uploadedAvatar.storagePath);
+      } catch (cleanupError) {
+        console.error('Erro ao remover foto de perfil após falha:', cleanupError);
+      }
+    }
+    return next(error);
+  }
+});
 
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
@@ -23,6 +87,7 @@ router.post('/login', async (req, res) => {
     // 1. Busca usuário e dados da empresa
     const userQuery = await pool.query(
       `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.email, u.role, u.is_active,
+              u.avatar_url,
               u.deleted_at, u.suspension_reason,
               u.operational_scope,
               t.is_active as tenant_active, t.name as tenant_name
@@ -90,6 +155,7 @@ router.post('/login', async (req, res) => {
         isSuspended: user.is_active === false,
         readonly_penalty: user.is_active === false,
         suspension_reason: user.suspension_reason,
+        avatar_url: user.avatar_url,
       }
     });
   } catch (error) {
@@ -136,6 +202,7 @@ router.get('/me', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.tenant_id, u.full_name, u.email, u.role, u.is_active,
+              u.avatar_url,
               u.suspension_reason, u.operational_scope,
               t.name AS tenant_name, t.operational_scope AS tenant_scope, t.is_active AS tenant_active
        FROM public.app_users u
@@ -174,6 +241,7 @@ router.get('/me', async (req, res) => {
         isSuspended: freshUser.is_active === false,
         readonly_penalty: freshUser.is_active === false,
         suspension_reason: freshUser.suspension_reason,
+        avatar_url: freshUser.avatar_url,
         tenant: {
           id: freshUser.tenant_id,
           name: freshUser.tenant_name,
