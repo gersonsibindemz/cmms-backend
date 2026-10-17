@@ -28,10 +28,16 @@ router.get('/', async (req, res, next) => {
   try {
     let queryText = `
       SELECT u.id, u.tenant_id, t.name AS tenant_name, u.email, u.full_name,
-             u.role, u.operational_scope, u.is_active, u.suspension_reason, u.created_at
+             u.role, u.operational_scope, u.is_active,
+             CASE
+               WHEN u.is_active IS TRUE THEN 'active'
+               WHEN u.deleted_at IS NOT NULL THEN 'deleted'
+               ELSE 'suspended'
+             END AS status,
+             u.deleted_at, u.suspension_reason, u.created_at
       FROM public.app_users u
       LEFT JOIN public.tenants t ON t.id = u.tenant_id
-      WHERE u.deleted_at IS NULL
+      WHERE TRUE
     `;
     const params = [];
 
@@ -301,6 +307,105 @@ router.delete('/:id', async (req, res, next) => {
     return next(error);
   }
 });
+
+async function reactivateUser(req, res, next) {
+  if (!UUID_PATTERN.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
+  }
+
+  try {
+    const outcome = await withTenantContext(null, 'super_admin', async (client) => {
+      const currentResult = await client.query(
+        `SELECT id, tenant_id, role, full_name, email, operational_scope, is_active, deleted_at
+         FROM public.app_users
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [req.params.id],
+      );
+      const current = currentResult.rows[0];
+      if (!current) return { userNotFound: true };
+
+      const tenantResult = await client.query(
+        `SELECT max_users_limit
+         FROM public.tenants
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [current.tenant_id],
+      );
+      const tenant = tenantResult.rows[0];
+      if (!tenant) return { tenantNotFound: true };
+
+      if (!current.is_active || current.deleted_at !== null) {
+        const countResult = await client.query(
+          `SELECT COUNT(*)::int AS total
+           FROM public.app_users
+           WHERE tenant_id = $1::uuid
+             AND is_active IS TRUE
+             AND deleted_at IS NULL
+             AND id <> $2::uuid`,
+          [current.tenant_id, current.id],
+        );
+        if (countResult.rows[0].total >= Number(tenant.max_users_limit)) {
+          return { limitReached: true };
+        }
+      }
+
+      const userResult = await client.query(
+        `UPDATE public.app_users
+         SET is_active = TRUE,
+             deleted_at = NULL,
+             suspension_reason = NULL,
+             updated_at = NOW()
+         WHERE id = $1::uuid
+         RETURNING id, tenant_id, email, full_name AS name, role,
+                   operational_scope, is_active, deleted_at, suspension_reason, created_at`,
+        [current.id],
+      );
+      const user = userResult.rows[0];
+
+      if (current.role === 'technician') {
+        await client.query(
+          `INSERT INTO public.technicians (
+             tenant_id, user_id, name, email, domain, status, deleted_at, updated_at
+           )
+           VALUES ($1::uuid, $2::uuid, $3, $4, $5, 'active', NULL, NOW())
+           ON CONFLICT (tenant_id, user_id) WHERE user_id IS NOT NULL
+           DO UPDATE SET name = EXCLUDED.name,
+                         email = EXCLUDED.email,
+                         domain = EXCLUDED.domain,
+                         status = 'active',
+                         deleted_at = NULL,
+                         updated_at = NOW()`,
+          [
+            current.tenant_id,
+            current.id,
+            current.full_name,
+            current.email,
+            current.operational_scope,
+          ],
+        );
+      }
+
+      return { user };
+    });
+
+    if (outcome.userNotFound) {
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+    if (outcome.tenantNotFound) {
+      return res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    if (outcome.limitReached) {
+      return res.status(403).json({ error: 'Limite de utilizadores atingido para este tenant.' });
+    }
+    return res.json({ user: outcome.user });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+router.put('/:id/reactivate', reactivateUser);
+router.patch('/:id/reactivate', reactivateUser);
 
 async function toggleUserSuspension(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
