@@ -57,7 +57,10 @@ router.post('/me/avatar', authenticateToken, parseAvatarUpload, async (req, res,
       await removeUserAvatar(uploadedAvatar.storagePath);
       return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
-    return res.json({ avatar_url: result.rows[0].avatar_url });
+    return res.json({
+      message: 'Avatar atualizado com sucesso.',
+      avatar_url: result.rows[0].avatar_url,
+    });
   } catch (error) {
     if (uploadedAvatar) {
       try {
