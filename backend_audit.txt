@@ -1,13 +1,13 @@
 AUDITORIA TÉCNICA DO BACKEND CMMS
-Data da revisão: 2026-10-16
-Escopo: código em src/ e migrações SQL versionadas em supabase/migrations/.
-Limitação: revisão estática do repositório; não houve ligação ao PostgreSQL de destino nem execução de testes automatizados.
+Data da revisão: 2026-10-17
+Escopo: código em src/ e migrações SQL versionadas em supabase/migrations/, incluindo as alterações até 20261016140000.
+Limitação: revisão estática do repositório; não houve ligação ao PostgreSQL de destino. Não foram encontrados ficheiros de testes automatizados nem scripts de teste no package.json.
 
 RESUMO EXECUTIVO
 ----------------
 - A API usa Express e PostgreSQL via pg Pool, com módulos de rotas separados por domínio.
 - O helper withTenantContext() inicia transações e define app.current_tenant e app.current_user_role para as queries que o utilizam.
-- As rotas de ativos, combustível, ordens de serviço, técnicos, notificações, peças e dashboard aplicam autenticação e enforceDomainScope. As rotas de administração e utilizadores aplicam controlos próprios por perfil.
+- As rotas de ativos, combustível, ordens de serviço, técnicos, notificações, planos de manutenção, peças e dashboard aplicam autenticação e enforceDomainScope. As rotas de administração e utilizadores aplicam controlos próprios por perfil.
 - O conjunto de migrações versionadas cobre várias tabelas operacionais e políticas RLS, mas não inclui a criação do esquema base de tenants, app_users e assets. A existência e configuração desse esquema no ambiente alvo continuam por confirmar.
 - A auditoria anterior exagerava a falta de migrações, a inconsistência de escopo por rota e o risco de falhas no consumo de peças. Esses pontos foram revistos abaixo com base no código e nas migrações atuais.
 
@@ -15,7 +15,7 @@ RESUMO EXECUTIVO
 --------------
 - Runtime: Node.js com ES modules e Express.
 - Entrada: src/server.js; health check: GET /health.
-- Prefixos montados: /api/auth, /api/super-admin, /api/admin, /api/users, /api/assets, /api/fuel, /api/work-orders, /api/technicians, /api/notifications, /api/maintenance-notifications, /api/parts e /api/dashboard.
+- Prefixos montados: /api/auth, /api/super-admin, /api/admin, /api/users, /api/assets, /api/fuel, /api/work-orders, /api/technicians, /api/notifications, /api/maintenance-notifications, /api/maintenance-plans, /api/parts e /api/dashboard.
 - Middleware global: CORS com credenciais e origem configurada por FRONTEND_URL, express.json(), cookieParser() e handler global de erro.
 - Persistência: pg.Pool configurado com DATABASE_URL e SSL; o código define rejectUnauthorized: false.
 
@@ -23,9 +23,10 @@ RESUMO EXECUTIVO
 -------------------------------------------
 - withTenantContext(tenantId, userRole, callback), em src/db.js, adquire uma ligação, executa BEGIN, define app.current_tenant e app.current_user_role via set_config(..., true), executa a callback e faz COMMIT ou ROLLBACK.
 - As rotas operacionais observadas usam este helper para as operações no banco. A autenticação constitui uma exceção: login e /api/auth/me consultam diretamente o pool, sem contexto tenant.
-- Migrações incluídas criam ou ajustam work_orders, technicians, work_order_events, asset_documents, notifications, maintenance_notifications, parts, work_order_parts, stock_movements e fuel_logs. Também adicionam limites/escalas operacionais, compatibilidade de custos e a coluna assets.province.
+- Migrações incluídas criam ou ajustam work_orders, technicians, work_order_events, asset_documents, notifications, maintenance_notifications, maintenance_plans, parts, work_order_parts, stock_movements e fuel_logs. Também adicionam limites e escopos operacionais, compatibilidade de custos, assets.province e campos de país/moeda dos tenants com configurações de preços de combustível.
 - A migração 20261016100000_allow_close_work_order_event.sql atualiza a constraint de work_order_events.event_type para aceitar o evento close, além de start, pause, resume, interrupt e complete.
 - As migrações definem RLS para as tabelas operacionais abrangidas, com políticas que usam app.current_tenant e permitem acesso quando app.current_user_role = 'super_admin'.
+- A migração de planos de manutenção ativa RLS e inclui escopo por tenant/domínio, intervalos por data/contador e lista de verificação. A tabela fuel_price_settings permite leitura de preços globais e do tenant e restringe escrita ao super_admin.
 - O repositório não contém uma migração de criação do esquema base tenants, app_users e assets. Também não permite confirmar a configuração efetiva de RLS, o proprietário das tabelas, o estado das migrações ou eventuais diferenças no banco de produção.
 
 3. AUTENTICAÇÃO E AUTORIZAÇÃO
@@ -44,6 +45,8 @@ RESUMO EXECUTIVO
 - Peças/stock: inclui criação, reposição e retirada, com registo em stock_movements.
 - Notificações e notificações de manutenção: rotas separadas, filtradas por tenant, domínio, utilizador e/ou perfil; a migração de maintenance_notifications inclui RLS e índices por tenant/domínio, estado e ativo.
 - Técnicos e dashboard: rotas operacionais com autenticação, escopo e consultas por tenant.
+- Planos de manutenção: CRUD lógico, ativação/desativação e geração transacional de ordens preventivas; a geração automática exige que o plano esteja ativo e que a data ou o contador tenham atingido o próximo disparo. A migração cria código PLN por sequência e unicidade do código dentro do tenant.
+- Combustível: há uma rota de preços de referência que procura primeiro preços específicos do tenant e depois preços globais por país/moeda.
 - As tabelas operacionais mencionadas têm suporte em migrações versionadas; a verificação de compatibilidade final depende de executar as migrações contra o esquema real.
 
 5. PONTOS POSITIVOS
@@ -54,6 +57,7 @@ RESUMO EXECUTIVO
 - Operações de stock e associação de peças a ordens de serviço agrupam atualização de saldo e registo de movimento na mesma transação. Reposição/retirada bloqueiam a linha da peça; o consumo em ordem valida o saldo na atualização.
 - As migrações das tabelas operacionais incluem índices, constraints e políticas RLS relevantes.
 - Limites de utilizadores são verificados dentro de transação que bloqueia a linha do tenant na criação pelo super_admin.
+- Planos de manutenção bloqueiam a linha do plano durante a geração da ordem e atualização do próximo disparo, evitando gerações concorrentes simultâneas para o mesmo plano.
 
 6. RISCOS E PONTOS DE ATENÇÃO
 -----------------------------
@@ -89,6 +93,10 @@ H. Reconciliação de stock sem mecanismo automático no banco
 - O código da API atualiza parts.current_stock e stock_movements dentro de transações, incluindo o consumo/devolução associados a work_order_parts. Não foram encontrados triggers SQL de negócio para manter estes valores sincronizados se houver escrita fora dos fluxos da API.
 - Impacto: integrações ou alterações diretas ao banco podem causar divergência; definir uma rotina de reconciliação e preservar o uso transacional da API.
 
+I. Preços de referência e custos de combustível não são integralmente multimoeda
+- A configuração de tenant inclui country/currency e fuel_price_settings procura preços por país/moeda, mas a rota devolve valores fixos de 75,00 e 86,25 quando não encontra preços configurados. A gravação do abastecimento continua a usar pricePerLiterMzn e as colunas price_per_liter_mzn/total_cost_mzn.
+- Impacto: tenants com moeda diferente de MZN podem receber preços de referência sem conversão, apresentados sob a moeda do tenant, e os custos gravados continuam explicitamente rotulados como MZN.
+
 7. RECOMENDAÇÕES PRIORIZADAS
 ----------------------------
 1. Validar, no ambiente alvo, o esquema base, a ordem/estado das migrações, privilégios e políticas RLS efetivas.
@@ -98,10 +106,11 @@ H. Reconciliação de stock sem mecanismo automático no banco
 5. Evitar devolver mensagens internas em respostas 500.
 6. Confirmar se são necessários o JWT no corpo e a autenticação pelo cabeçalho Authorization; se a intenção for autenticação exclusivamente por cookie HttpOnly, remover o caminho alternativo.
 7. Definir rotina de reconciliação de parts.current_stock com stock_movements e work_order_parts, especialmente para alterações fora da API.
-8. Executar testes de integração contra o PostgreSQL com RLS habilitado; não há ficheiros de teste identificados no repositório nesta revisão.
+8. Completar a migração multimoeda dos abastecimentos: definir os preços de fallback por moeda ou removê-los e alinhar o campo recebido e as colunas de custo persistidas com a moeda do tenant.
+9. Executar testes de integração contra o PostgreSQL com RLS habilitado; não há ficheiros de teste identificados no repositório nesta revisão.
 
 8. CONCLUSÃO
 ------------
-O backend tem uma base modular e um padrão útil de contexto tenant transacional, com middleware de escopo aplicado às principais rotas operacionais e migrações para várias tabelas e políticas RLS. A auditoria estática não confirma o estado efetivo do banco de produção. As prioridades são verificar esse contrato de banco, fechar a janela de revogação de tokens, validar TLS, tornar atómico o limite de ativos e reduzir a exposição de erros internos.
+O backend tem uma base modular e um padrão útil de contexto tenant transacional, com middleware de escopo aplicado às principais rotas operacionais, planos de manutenção com geração transacional de ordens e migrações para várias tabelas e políticas RLS. A auditoria estática não confirma o estado efetivo do banco de produção. As prioridades são verificar esse contrato de banco, fechar a janela de revogação de tokens, validar TLS, tornar atómico o limite de ativos, reduzir a exposição de erros internos e concluir a consistência multimoeda dos abastecimentos.
 
-Este ficheiro foi atualizado em 2026-10-16 com base no código e nas migrações versionadas no repositório.
+Este ficheiro foi atualizado em 2026-10-17 com base no código e nas migrações versionadas no repositório.
