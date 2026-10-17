@@ -1,13 +1,17 @@
 import { Router } from 'express';
 import { withTenantContext } from '../db.js';
 import { authenticateToken, requireRoles } from '../middlewares/auth.js';
-import { createTenantHandler } from './adminTenants.js';
+import {
+  createTenantHandler,
+  toggleTenantStatusHandler,
+} from './adminTenants.js';
 
 const router = Router();
 
 router.use(authenticateToken, requireRoles('super_admin'));
 
 router.post('/tenants', createTenantHandler);
+router.patch('/tenants/:id/toggle-status', toggleTenantStatusHandler);
 
 router.get('/tenants', async (req, res, next) => {
   try {
@@ -22,6 +26,7 @@ router.get('/tenants', async (req, res, next) => {
            t.country,
            t.currency,
            t.is_active,
+           t.suspension_reason,
            t.max_assets_limit,
            (SELECT COUNT(*)::int FROM assets AS a WHERE a.tenant_id = t.id) AS total_assets,
            (SELECT COUNT(*)::int FROM app_users AS u WHERE u.tenant_id = t.id) AS total_users

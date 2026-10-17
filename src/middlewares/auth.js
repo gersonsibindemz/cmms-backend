@@ -10,7 +10,7 @@ const USER_ROLES = new Set([
   'driver_operator',
 ]);
 
-export function authenticateToken(req, res, next) {
+export async function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization || req.headers.Authorization;
   let token = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -29,18 +29,61 @@ export function authenticateToken(req, res, next) {
       return res.status(403).json({ message: 'Token inválido ou expirado.' });
     }
 
+    const userId = payload.id ?? payload.userId;
+    if (typeof userId !== 'string') {
+      return res.status(403).json({ message: 'Token inválido ou expirado.' });
+    }
+    const result = await withTenantContext(payload.tenantId ?? null, payload.role, (client) =>
+      client.query(
+        `SELECT users.is_active,
+                users.deleted_at,
+                tenants.is_active AS tenant_active
+         FROM public.app_users AS users
+         LEFT JOIN public.tenants AS tenants ON tenants.id = users.tenant_id
+         WHERE users.id = $1::uuid
+           AND (
+             ($2::uuid IS NULL AND $3::text = 'super_admin')
+             OR users.tenant_id = $2::uuid
+           )`,
+        [userId, payload.tenantId ?? null, payload.role],
+      ),
+    );
+    const currentUser = result.rows[0];
+    if (
+      !currentUser
+      || currentUser.deleted_at !== null
+      || (payload.role !== 'super_admin' && currentUser.tenant_active !== true)
+    ) {
+      return res.status(403).json({ message: 'Token inválido ou expirado.' });
+    }
+
+    const isSuspended = currentUser.is_active === false;
     req.user = {
-      id: payload.id ?? payload.userId,
+      id: userId,
       tenantId: payload.tenantId,
       role: payload.role,
       fullName: payload.fullName,
       operational_scope: payload.operational_scope,
+      isSuspended,
+      readonly_penalty: isSuspended,
     };
     req.userScope = req.user.operational_scope || 'fleet';
 
+    if (
+      isSuspended
+      && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
+    ) {
+      return res.status(403).json({
+        message: 'Conta suspensa. Acesso apenas de leitura.',
+      });
+    }
+
     return next();
-  } catch {
-    return res.status(403).json({ message: 'Token inválido ou expirado.' });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return res.status(403).json({ message: 'Token inválido ou expirado.' });
+    }
+    return next(error);
   }
 }
 

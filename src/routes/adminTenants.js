@@ -14,7 +14,7 @@ router.get('/tenants', async (req, res, next) => {
     const result = await withTenantContext(null, 'super_admin', (client) =>
       client.query(
         `SELECT tenants.id, tenants.name, tenants.trade_name, tenants.nuit,
-                tenants.province, tenants.is_active, tenants.status,
+                tenants.province, tenants.is_active, tenants.suspension_reason, tenants.status,
                 tenants.max_assets_limit,
                 tenants.max_users_limit, tenants.operational_scope,
                 tenants.default_operational_scope,
@@ -251,34 +251,66 @@ router.delete('/tenants/:id', async (req, res, next) => {
   }
 });
 
-router.patch('/tenants/:id/status', async (req, res, next) => {
+export async function toggleTenantStatusHandler(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ error: 'Identificador do tenant inválido.' });
   }
   const requestedStatus = req.body?.is_active
     ?? req.body?.isActive
     ?? (req.body?.status === 'active' ? true : req.body?.status === 'suspended' ? false : undefined);
-  if (typeof requestedStatus !== 'boolean') {
-    return res.status(400).json({ error: 'O estado deve ser ativo ou suspenso.' });
+  const requestedReason = req.body?.suspension_reason ?? req.body?.reason;
+  if (
+    (requestedStatus !== undefined && typeof requestedStatus !== 'boolean')
+    || (req.body?.status !== undefined
+      && !['active', 'suspended'].includes(req.body.status))
+    || (requestedStatus === undefined && !req.path.endsWith('/toggle-status'))
+    || (requestedReason !== undefined
+      && requestedReason !== null
+      && (typeof requestedReason !== 'string' || requestedReason.trim().length > 5000))
+  ) {
+    return res.status(400).json({ error: 'O estado ou a justificativa de suspensão são inválidos.' });
   }
 
   try {
-    const result = await withTenantContext(null, 'super_admin', (client) =>
-      client.query(
+    const tenant = await withTenantContext(null, 'super_admin', async (client) => {
+      const currentResult = await client.query(
+        `SELECT is_active
+         FROM public.tenants
+         WHERE id = $1::uuid
+         FOR UPDATE`,
+        [req.params.id],
+      );
+      const current = currentResult.rows[0];
+      if (!current) return null;
+
+      const isActive = requestedStatus ?? !current.is_active;
+      const suspensionReason = isActive ? null : requestedReason?.trim();
+      if (!isActive && !suspensionReason) return { missingReason: true };
+
+      const result = await client.query(
         `UPDATE public.tenants
-         SET is_active = $1
-         WHERE id = $2::uuid
-         RETURNING id, name, is_active`,
-        [requestedStatus, req.params.id],
-      ),
-    );
-    if (result.rowCount === 0) {
+         SET is_active = $1,
+             suspension_reason = $2,
+             updated_at = NOW()
+         WHERE id = $3::uuid
+         RETURNING id, name, is_active, suspension_reason`,
+        [isActive, suspensionReason, req.params.id],
+      );
+      return result.rows[0];
+    });
+    if (!tenant) {
       return res.status(404).json({ error: 'Tenant não encontrado.' });
     }
-    return res.json({ tenant: result.rows[0] });
+    if (tenant.missingReason) {
+      return res.status(400).json({ error: 'A justificativa é obrigatória para suspender a empresa.' });
+    }
+    return res.json({ tenant });
   } catch (error) {
     return next(error);
   }
-});
+}
+
+router.patch('/tenants/:id/status', toggleTenantStatusHandler);
+router.patch('/tenants/:id/toggle-status', toggleTenantStatusHandler);
 
 export default router;

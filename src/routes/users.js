@@ -28,7 +28,7 @@ router.get('/', async (req, res, next) => {
   try {
     let queryText = `
       SELECT u.id, u.tenant_id, t.name AS tenant_name, u.email, u.full_name,
-             u.role, u.operational_scope, u.is_active, u.created_at
+             u.role, u.operational_scope, u.is_active, u.suspension_reason, u.created_at
       FROM public.app_users u
       LEFT JOIN public.tenants t ON t.id = u.tenant_id
       WHERE u.deleted_at IS NULL
@@ -114,7 +114,7 @@ router.post('/', async (req, res, next) => {
          )
          VALUES ($1::uuid, $2, $3, $4, $5::public.user_role, $6)
          RETURNING id, tenant_id, email, full_name AS name, role,
-                   operational_scope, is_active, created_at`,
+                    operational_scope, is_active, suspension_reason, created_at`,
         [tenantId, email.trim().toLowerCase(), passwordHash, fullName.trim(), role, operationalScope],
       );
       const user = userResult.rows[0];
@@ -196,7 +196,7 @@ async function updateUser(req, res, next) {
          WHERE id = $6::uuid
            AND deleted_at IS NULL
          RETURNING id, tenant_id, email, full_name AS name, role,
-                   operational_scope, is_active, created_at`,
+                    operational_scope, is_active, suspension_reason, created_at`,
         [
           email.trim().toLowerCase(),
           name.trim(),
@@ -302,29 +302,74 @@ router.delete('/:id', async (req, res, next) => {
   }
 });
 
-router.patch('/:id/toggle-status', async (req, res, next) => {
+async function toggleUserSuspension(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
   }
+
+  const requestedReason = req.body?.suspension_reason ?? req.body?.reason;
+  if (
+    requestedReason !== undefined
+    && requestedReason !== null
+    && (typeof requestedReason !== 'string' || requestedReason.trim().length > 5000)
+  ) {
+    return res.status(400).json({ error: 'Justificativa de suspensão inválida.' });
+  }
+
   try {
-    const result = await withTenantContext(null, 'super_admin', (client) =>
-      client.query(
+    const user = await withTenantContext(null, 'super_admin', async (client) => {
+      const currentResult = await client.query(
+        `SELECT id, tenant_id, role, is_active
+         FROM public.app_users
+         WHERE id = $1::uuid
+           AND deleted_at IS NULL
+         FOR UPDATE`,
+        [req.params.id],
+      );
+      const current = currentResult.rows[0];
+      if (!current) return null;
+
+      const isActive = !current.is_active;
+      const suspensionReason = isActive ? null : requestedReason?.trim();
+      if (!isActive && !suspensionReason) return { missingReason: true };
+
+      const result = await client.query(
         `UPDATE public.app_users
-         SET is_active = NOT is_active
+         SET is_active = $2,
+             suspension_reason = $3
          WHERE id = $1::uuid
            AND deleted_at IS NULL
          RETURNING id, tenant_id, email, full_name AS name, role,
-                   operational_scope, is_active`,
-        [req.params.id],
-      ),
-    );
-    if (result.rowCount === 0) {
+                   operational_scope, is_active, suspension_reason`,
+        [req.params.id, isActive, suspensionReason],
+      );
+
+      if (current.role === 'technician') {
+        await client.query(
+          `UPDATE public.technicians
+           SET status = $1,
+               updated_at = NOW()
+           WHERE tenant_id = $2::uuid
+             AND user_id = $3::uuid
+             AND deleted_at IS NULL`,
+          [isActive ? 'active' : 'inactive', current.tenant_id, current.id],
+        );
+      }
+      return result.rows[0];
+    });
+    if (!user) {
       return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
-    return res.json({ user: result.rows[0] });
+    if (user.missingReason) {
+      return res.status(400).json({ error: 'A justificativa é obrigatória para suspender o utilizador.' });
+    }
+    return res.json({ user });
   } catch (error) {
     return next(error);
   }
-});
+}
+
+router.patch('/:id/suspend', toggleUserSuspension);
+router.patch('/:id/toggle-status', toggleUserSuspension);
 
 export default router;

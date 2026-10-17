@@ -23,6 +23,7 @@ router.post('/login', async (req, res) => {
     // 1. Busca usuário e dados da empresa
     const userQuery = await pool.query(
       `SELECT u.id, u.tenant_id, u.password_hash, u.full_name, u.email, u.role, u.is_active,
+              u.deleted_at, u.suspension_reason,
               u.operational_scope,
               t.is_active as tenant_active, t.name as tenant_name
        FROM app_users u
@@ -37,8 +38,8 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Credenciais inválidas.' });
     }
 
-    if (!user.is_active) {
-      return res.status(403).json({ error: 'Utilizador inativo.' });
+    if (user.deleted_at !== null) {
+      return res.status(403).json({ error: 'Utilizador eliminado.' });
     }
 
     // Se não for super_admin, valida se o tenant está ativo
@@ -60,6 +61,8 @@ router.post('/login', async (req, res) => {
         role: user.role,
         fullName: user.full_name,
         operational_scope: user.operational_scope,
+        isSuspended: user.is_active === false,
+        readonly_penalty: user.is_active === false,
       },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
@@ -84,6 +87,9 @@ router.post('/login', async (req, res) => {
         tenantId: user.tenant_id,
         tenantName: user.tenant_name,
         operational_scope: user.operational_scope,
+        isSuspended: user.is_active === false,
+        readonly_penalty: user.is_active === false,
+        suspension_reason: user.suspension_reason,
       }
     });
   } catch (error) {
@@ -129,7 +135,8 @@ router.get('/me', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT u.id, u.tenant_id, u.full_name, u.email, u.role, u.is_active, u.operational_scope,
+      `SELECT u.id, u.tenant_id, u.full_name, u.email, u.role, u.is_active,
+              u.suspension_reason, u.operational_scope,
               t.name AS tenant_name, t.operational_scope AS tenant_scope, t.is_active AS tenant_active
        FROM public.app_users u
        LEFT JOIN public.tenants t ON t.id = u.tenant_id
@@ -141,7 +148,6 @@ router.get('/me', async (req, res) => {
     const freshUser = result.rows[0];
     if (
       !freshUser
-      || freshUser.is_active === false
       || (freshUser.role !== 'super_admin' && freshUser.tenant_active !== true)
     ) {
       res.clearCookie('auth_token', {
@@ -165,6 +171,9 @@ router.get('/me', async (req, res) => {
         tenantId: freshUser.tenant_id,
         tenantName: freshUser.tenant_name,
         operational_scope: freshUser.operational_scope,
+        isSuspended: freshUser.is_active === false,
+        readonly_penalty: freshUser.is_active === false,
+        suspension_reason: freshUser.suspension_reason,
         tenant: {
           id: freshUser.tenant_id,
           name: freshUser.tenant_name,

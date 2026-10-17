@@ -259,6 +259,7 @@ router.get('/', requireTenant, async (req, res) => {
         `
       SELECT 
         id, code_tag, name, category, criticality_level, brand, model, manufacture_year, domain,
+        asset_type, asset_subtype, energy_type, ownership_type, axle_config,
         operational_scope, current_meter::double precision AS current_meter,
         meter_kind, status, cost_center, province,
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
@@ -447,11 +448,18 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
           for (const field of [
             'brand', 'model', 'licensePlate', 'license_plate', 'chassisVin',
             'chassis_vin', 'plantSector', 'plant_sector', 'voltageSpecs', 'voltage_specs',
+            'asset_type', 'assetType', 'asset_subtype', 'assetSubtype',
+            'energy_type', 'energyType', 'ownership_type', 'ownershipType',
           ]) {
             const value = item[field];
             if (value !== undefined && value !== null && typeof value !== 'string') {
               throw new Error(`Campo inválido: ${field}.`);
             }
+          }
+          const axleConfig = item.axle_config ?? item.axleConfig;
+          if (axleConfig !== undefined && axleConfig !== null &&
+            (!Number.isInteger(axleConfig) || axleConfig < 1)) {
+            throw new Error('Configuração de eixos inválida.');
           }
           for (const field of ['manufactureYear', 'manufacture_year', 'powerKwKva', 'power_kw_kva']) {
             const value = item[field];
@@ -477,13 +485,14 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
             `INSERT INTO public.assets (
                tenant_id, domain, operational_scope, name, code_tag, category,
                brand, model, manufacture_year, status, meter_kind, current_meter,
-               license_plate, chassis_vin, plant_sector, power_kw_kva, voltage_specs
-             )
-             VALUES (
-               $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-               $13, $14, $15, $16, $17
-             )
-             RETURNING *`,
+                 asset_type, asset_subtype, energy_type, ownership_type, axle_config,
+                 license_plate, chassis_vin, plant_sector, power_kw_kva, voltage_specs
+               )
+               VALUES (
+                 $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+               )
+               RETURNING *`,
             [
               tenantId,
               userScope,
@@ -497,6 +506,11 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
               item.status ?? 'operational',
               userScope === 'fleet' ? 'odometer_km' : 'hour_meter',
               currentMeter,
+              item.asset_type ?? item.assetType ?? null,
+              item.asset_subtype ?? item.assetSubtype ?? null,
+              item.energy_type ?? item.energyType ?? null,
+              item.ownership_type ?? item.ownershipType ?? null,
+              axleConfig,
               item.licensePlate ?? item.license_plate ?? null,
               item.chassisVin ?? item.chassis_vin ?? null,
               item.plantSector ?? item.plant_sector ?? null,
@@ -544,11 +558,30 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
       licensePlate, chassisVin, engineNumber, inatroInspectionExpiry,
       insurancePolicyNumber, insuranceCompany, insuranceExpiry, fuelTankCapacityLiters,
       plantSector, voltageSpecs, powerKwKva, innoqCalibrationExpiry,
-      pressureTestExpiry, localSupplierName, warrantyExpiry, technicalSpecs
+      pressureTestExpiry, localSupplierName, warrantyExpiry, technicalSpecs,
+      assetType: requestedAssetType, asset_type: assetTypeSnake,
+      assetSubtype: requestedAssetSubtype, asset_subtype: assetSubtypeSnake,
+      energyType: requestedEnergyType, energy_type: energyTypeSnake,
+      ownershipType: requestedOwnershipType, ownership_type: ownershipTypeSnake,
+      axleConfig: requestedAxleConfig, axle_config: axleConfigSnake,
     } = req.body;
+    const assetType = assetTypeSnake ?? requestedAssetType;
+    const assetSubtype = assetSubtypeSnake ?? requestedAssetSubtype;
+    const energyType = energyTypeSnake ?? requestedEnergyType;
+    const ownershipType = ownershipTypeSnake ?? requestedOwnershipType;
+    const axleConfig = axleConfigSnake ?? requestedAxleConfig;
 
-    if (!name || !category) {
-      return res.status(400).json({ error: 'Nome e categoria são obrigatórios.' });
+    if (
+      typeof name !== 'string' || !name.trim()
+      || typeof category !== 'string' || !category.trim()
+      || [assetType, assetSubtype, energyType, ownershipType].some(
+        (value) => value !== undefined && value !== null
+          && (typeof value !== 'string' || value.length > 255),
+      )
+      || (axleConfig !== undefined && axleConfig !== null
+        && (!Number.isInteger(axleConfig) || axleConfig < 1))
+    ) {
+      return res.status(400).json({ error: 'Dados do ativo inválidos.' });
     }
 
     const assetDomain = req.userScope;
@@ -574,14 +607,16 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
         license_plate, chassis_vin, engine_number, inatro_inspection_expiry,
         insurance_policy_number, insurance_company, insurance_expiry, fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
+        asset_type, asset_subtype, energy_type, ownership_type, axle_config,
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs, domain
       ) VALUES (
         $1, $2, $3, $4, COALESCE($5, 'B'), $6, $7, $8,
         COALESCE($9, 0), COALESCE($10, 'odometer_km')::meter_type, $11, $12,
         $13, $14, $15, $16,
-        $17, $18, $19, $20,
-        $21, $22, $23, $24,
-        $25, $26, $27, COALESCE($28, '{}'::jsonb), $29
+        $17, $18, $19, $20, $21,
+        $22, $23, $24,
+        $25, $26, $27, $28, $29,
+        $30, $31, $32, COALESCE($33, '{}'::jsonb), $34
       ) RETURNING *;
     `;
 
@@ -594,8 +629,10 @@ router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) =>
       emptyToNull(insurancePolicyNumber), emptyToNull(insuranceCompany),
       emptyToNull(insuranceExpiry), emptyToNull(fuelTankCapacityLiters),
       emptyToNull(plantSector), emptyToNull(voltageSpecs), emptyToNull(powerKwKva),
-      emptyToNull(innoqCalibrationExpiry), emptyToNull(pressureTestExpiry),
-      emptyToNull(localSupplierName), emptyToNull(warrantyExpiry),
+      emptyToNull(innoqCalibrationExpiry),
+      emptyToNull(assetType), emptyToNull(assetSubtype), emptyToNull(energyType),
+      emptyToNull(ownershipType), emptyToNull(axleConfig),
+      emptyToNull(pressureTestExpiry), emptyToNull(localSupplierName), emptyToNull(warrantyExpiry),
       emptyToNull(technicalSpecs) ? JSON.stringify(technicalSpecs) : '{}',
       assetDomain,
     ];
@@ -621,6 +658,11 @@ async function updateAsset(req, res) {
     const fields = [
       ['name', 'name'],
       ['category', 'category'],
+      ['assetType', 'asset_type'],
+      ['assetSubtype', 'asset_subtype'],
+      ['energyType', 'energy_type'],
+      ['ownershipType', 'ownership_type'],
+      ['axleConfig', 'axle_config'],
       ['criticalityLevel', 'criticality_level'],
       ['brand', 'brand'],
       ['model', 'model'],
@@ -649,10 +691,26 @@ async function updateAsset(req, res) {
     const values = [];
     const assignments = [];
     for (const [bodyKey, column] of fields) {
-      if (!Object.hasOwn(body, bodyKey)) continue;
-      let value = body[bodyKey];
+      const snakeKey = bodyKey.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+      const inputKey = Object.hasOwn(body, bodyKey) ? bodyKey : snakeKey;
+      if (!Object.hasOwn(body, inputKey)) continue;
+      let value = body[inputKey];
       if (bodyKey === 'technicalSpecs' && value !== null) {
         value = JSON.stringify(value);
+      }
+      if (
+        ['assetType', 'assetSubtype', 'energyType', 'ownershipType'].includes(bodyKey)
+        && value !== null
+        && (typeof value !== 'string' || value.length > 255)
+      ) {
+        return res.status(400).json({ error: `Campo inválido: ${inputKey}.` });
+      }
+      if (
+        bodyKey === 'axleConfig'
+        && value !== null
+        && (!Number.isInteger(value) || value < 1)
+      ) {
+        return res.status(400).json({ error: 'Configuração de eixos inválida.' });
       }
       values.push(value);
       assignments.push(`${column} = $${values.length}`);
