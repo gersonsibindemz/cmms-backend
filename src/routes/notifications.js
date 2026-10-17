@@ -67,21 +67,32 @@ router.get('/check-compliance', async (req, res, next) => {
       const createdNotifications = [];
 
       for (const asset of expiringAssets.rows) {
-        const logResult = await client.query(
-          `INSERT INTO public.compliance_notification_logs (
-             tenant_id, asset_id, compliance_type, notification_date
-           )
-           VALUES ($1::uuid, $2::uuid, $3, CURRENT_DATE)
-           ON CONFLICT (tenant_id, asset_id, compliance_type, notification_date)
-           DO NOTHING
-           RETURNING id`,
+        const existingLog = await client.query(
+          `SELECT id
+           FROM public.compliance_notification_logs
+           WHERE tenant_id = $1::uuid
+             AND asset_id = $2::uuid
+             AND compliance_type = $3
+           LIMIT 1`,
           [
             asset.tenant_id,
             asset.asset_id,
             asset.compliance_type,
           ],
         );
-        if (logResult.rowCount === 0) continue;
+        if (existingLog.rowCount > 0) continue;
+
+        await client.query(
+          `INSERT INTO public.compliance_notification_logs (
+             tenant_id, asset_id, compliance_type, notification_date
+           )
+           VALUES ($1::uuid, $2::uuid, $3, CURRENT_DATE)`,
+          [
+            asset.tenant_id,
+            asset.asset_id,
+            asset.compliance_type,
+          ],
+        );
 
         const message = `${asset.compliance_type === 'insurance' ? 'O seguro' : 'A inspeção INATRO'} do ativo ${asset.asset_name} (${asset.code_tag}) vence em ${asset.expiry_date}.`;
         for (const targetRole of ['supervisor', 'tenant_admin']) {
