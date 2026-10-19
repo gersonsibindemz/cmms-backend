@@ -129,8 +129,8 @@ router.post('/', requireTenant, async (req, res, next) => {
            problem_description, attachment_urls, status
          )
          VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::date,
-           $10::uuid, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
+           $10::uuid, $11, $12, $13, $14, $15, $16, $17, $18::text[], $19
          )
          RETURNING *`,
         [
@@ -151,7 +151,7 @@ router.post('/', requireTenant, async (req, res, next) => {
           meterReading ?? null,
           operationalStatus?.trim() || null,
           problemDescription.trim(),
-          JSON.stringify(attachmentUrls ?? []),
+          attachmentUrls ?? [],
           status,
         ],
       );

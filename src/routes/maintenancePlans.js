@@ -72,10 +72,10 @@ function validatePlanFields(plan) {
         && UUID_PATTERN.test(plan.assigned_technician_id))
     )
     && (
-      plan.plan_code === undefined
-      || plan.plan_code === null
-      || (typeof plan.plan_code === 'string'
-        && /^PLN-[A-Za-z0-9-]{1,20}$/.test(plan.plan_code.trim()))
+      plan.code_tag === undefined
+      || plan.code_tag === null
+      || (typeof plan.code_tag === 'string'
+        && /^PLN-[A-Za-z0-9-]{1,20}$/.test(plan.code_tag.trim()))
     );
 }
 
@@ -155,12 +155,12 @@ router.post(
   requireRoles(...PLAN_MANAGERS),
   async (req, res, next) => {
     const plan = req.body ?? {};
-    const requestedPlanCode = plan.plan_code ?? plan.code;
-    const planCode = typeof requestedPlanCode === 'string'
-      && requestedPlanCode.trim() === ''
+    const requestedPlanCodeTag = plan.code_tag ?? plan.code;
+    const planCodeTag = typeof requestedPlanCodeTag === 'string'
+      && requestedPlanCodeTag.trim() === ''
       ? null
-      : requestedPlanCode ?? null;
-    if (!validatePlanFields({ ...plan, plan_code: planCode })) {
+      : requestedPlanCodeTag ?? null;
+    if (!validatePlanFields({ ...plan, code_tag: planCodeTag })) {
       return res.status(400).json({ error: 'Dados do plano de manutenção inválidos.' });
     }
 
@@ -173,9 +173,9 @@ router.post(
         }
         const result = await client.query(
           `INSERT INTO public.maintenance_plans (
-             tenant_id, plan_code, asset_id, domain, title, trigger_type, interval_days,
+             tenant_id, code_tag, asset_id, domain, title, trigger_type, interval_days,
              interval_meter, checklist_items, assigned_technician_id,
-             next_due_at, next_due_meter
+             next_due_date, last_executed_meter
            )
            VALUES (
              $1::uuid,
@@ -192,7 +192,7 @@ router.post(
            RETURNING *`,
           [
             req.user.tenantId,
-            planCode?.trim() || null,
+            planCodeTag?.trim() || null,
             asset.id,
             asset.domain,
             plan.title.trim(),
@@ -274,9 +274,9 @@ router.put(
                interval_meter = $6,
                checklist_items = $7::jsonb,
                assigned_technician_id = $8::uuid,
-               next_due_at = CASE WHEN $4 IN ('time', 'both')
+               next_due_date = CASE WHEN $4 IN ('time', 'both')
                  THEN CURRENT_DATE + $5::integer ELSE NULL END,
-               next_due_meter = CASE WHEN $4 IN ('meter', 'both')
+               last_executed_meter = CASE WHEN $4 IN ('meter', 'both')
                  THEN COALESCE($9::numeric, 0) + $6::numeric ELSE NULL END,
                updated_at = NOW()
            WHERE id = $10::uuid
@@ -378,10 +378,10 @@ router.post(
         const plan = result.rows[0];
         if (!plan) return { notFound: true };
         if (automatic) {
-          const timeDue = plan.next_due_at
-            && new Date(plan.next_due_at).getTime() <= Date.now();
-          const meterDue = plan.next_due_meter !== null
-            && Number(plan.current_meter ?? 0) >= Number(plan.next_due_meter);
+          const timeDue = plan.next_due_date
+            && new Date(plan.next_due_date).getTime() <= Date.now();
+          const meterDue = plan.last_executed_meter !== null
+            && Number(plan.current_meter ?? 0) >= Number(plan.last_executed_meter);
           if (!plan.is_active || !(timeDue || meterDue)) return { notDue: true };
         }
 
@@ -409,16 +409,16 @@ router.post(
         );
         await client.query(
           `UPDATE public.maintenance_plans
-           SET last_generated_at = NOW(),
-               last_work_order_id = $1::uuid,
-               next_due_at = CASE WHEN trigger_type IN ('time', 'both')
+           SET last_executed_at = NOW(),
+               last_executed_meter = $1::numeric,
+               next_due_date = CASE WHEN trigger_type IN ('time', 'both')
                  THEN CURRENT_DATE + interval_days ELSE NULL END,
-               next_due_meter = CASE WHEN trigger_type IN ('meter', 'both')
+               last_executed_meter = CASE WHEN trigger_type IN ('meter', 'both')
                  THEN COALESCE($2::numeric, 0) + interval_meter ELSE NULL END,
                updated_at = NOW()
            WHERE id = $3::uuid
              AND tenant_id = $4::uuid`,
-          [orderResult.rows[0].id, plan.current_meter, plan.id, req.user.tenantId],
+          [plan.current_meter, plan.id, req.user.tenantId],
         );
         return { workOrder: orderResult.rows[0] };
       });
