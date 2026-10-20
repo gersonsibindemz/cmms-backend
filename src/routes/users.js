@@ -8,22 +8,35 @@ const USER_ROLES = new Set(['tenant_admin', 'supervisor', 'technician', 'driver_
 const OPERATIONAL_SCOPES = new Set(['fleet', 'plant']);
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
-router.use(authenticateToken, (req, res, next) => {
+router.use(authenticateToken);
+
+function requireSuperAdmin(req, res, next) {
   if (req.user?.role !== 'super_admin') {
     return res.status(403).json({
       error: 'Acesso restrito à equipa de administração da Avexas.',
     });
   }
   return next();
-});
+}
 
 router.get('/', async (req, res, next) => {
-  const targetTenant = req.query.tenant_id;
-  if (targetTenant !== undefined && (
-    typeof targetTenant !== 'string' || !UUID_PATTERN.test(targetTenant)
-  )) {
-    return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+  let targetTenant;
+  if (req.user?.role === 'super_admin') {
+    targetTenant = req.query.tenant_id;
+    if (targetTenant !== undefined && (
+      typeof targetTenant !== 'string' || !UUID_PATTERN.test(targetTenant)
+    )) {
+      return res.status(400).json({ error: 'Identificador do tenant inválido.' });
+    }
+  } else {
+    targetTenant = req.user?.tenantId;
+    if (!targetTenant) {
+      return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
+    }
   }
+
+  const roleFilter = req.query.role;
+  const scopeFilter = req.query.operational_scope;
 
   try {
     let queryText = `
@@ -46,18 +59,32 @@ router.get('/', async (req, res, next) => {
       queryText += ` AND u.tenant_id = $${params.length}::uuid`;
     }
 
+    if (req.user?.role !== 'super_admin') {
+      queryText += ' AND u.deleted_at IS NULL AND u.is_active IS TRUE';
+    }
+
+    if (roleFilter && USER_ROLES.has(roleFilter)) {
+      params.push(roleFilter);
+      queryText += ` AND u.role = $${params.length}::public.user_role`;
+    }
+
+    if (scopeFilter && OPERATIONAL_SCOPES.has(scopeFilter)) {
+      params.push(scopeFilter);
+      queryText += ` AND u.operational_scope = $${params.length}`;
+    }
+
     queryText += ' ORDER BY u.created_at DESC;';
 
-    const result = await withTenantContext(null, 'super_admin', (client) => {
+    const result = await withTenantContext(targetTenant || null, req.user?.role || 'super_admin', (client) => {
       return client.query(queryText, params);
     });
-    return res.json({ success: true, data: result.rows });
+    return res.json({ success: true, data: result.rows, users: result.rows });
   } catch (error) {
     return next(error);
   }
 });
 
-router.post('/', async (req, res, next) => {
+router.post('/', requireSuperAdmin, async (req, res, next) => {
   const {
     tenant_id: tenantId,
     full_name: fullName,
@@ -265,10 +292,10 @@ async function updateUser(req, res, next) {
   }
 }
 
-router.put('/:id', updateUser);
-router.patch('/:id', updateUser);
+router.put('/:id', requireSuperAdmin, updateUser);
+router.patch('/:id', requireSuperAdmin, updateUser);
 
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', requireSuperAdmin, async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ error: 'Identificador do utilizador inválido.' });
   }
@@ -404,8 +431,8 @@ async function reactivateUser(req, res, next) {
   }
 }
 
-router.put('/:id/reactivate', reactivateUser);
-router.patch('/:id/reactivate', reactivateUser);
+router.put('/:id/reactivate', requireSuperAdmin, reactivateUser);
+router.patch('/:id/reactivate', requireSuperAdmin, reactivateUser);
 
 async function toggleUserSuspension(req, res, next) {
   if (!UUID_PATTERN.test(req.params.id)) {
@@ -474,7 +501,7 @@ async function toggleUserSuspension(req, res, next) {
   }
 }
 
-router.patch('/:id/suspend', toggleUserSuspension);
-router.patch('/:id/toggle-status', toggleUserSuspension);
+router.patch('/:id/suspend', requireSuperAdmin, toggleUserSuspension);
+router.patch('/:id/toggle-status', requireSuperAdmin, toggleUserSuspension);
 
 export default router;
