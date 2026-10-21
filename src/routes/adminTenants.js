@@ -7,9 +7,72 @@ const router = Router();
 const OPERATIONAL_SCOPES = new Set(['fleet', 'plant', 'mixed']);
 const UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
-router.use(authenticateToken, requireRole(['super_admin']));
+router.use(authenticateToken);
 
-router.get('/tenants', async (req, res, next) => {
+
+// GET /api/admin/tenants/current - Permite ao tenant_admin visualizar dados da sua empresa em modo read-only
+router.get('/tenants/current', async (req, res, next) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(403).json({ error: 'Empresa do utilizador não identificada.' });
+  }
+
+  try {
+    const result = await withTenantContext(tenantId, req.user.role, (client) =>
+      client.query(
+        `SELECT id, name, trade_name, nuit, province, is_active,
+                status, max_assets_limit, max_users_limit, operational_scope,
+                default_operational_scope, country, currency, created_at,
+                (SELECT COUNT(*)::int FROM public.assets WHERE tenant_id = tenants.id AND deleted_at IS NULL AND status <> 'decommissioned') AS total_assets,
+                (SELECT COUNT(*)::int FROM public.app_users WHERE tenant_id = tenants.id AND deleted_at IS NULL) AS total_users
+         FROM public.tenants
+         WHERE id = $1::uuid`,
+        [tenantId]
+      )
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Empresa não encontrada.' });
+    return res.json({ tenant: result.rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/admin/tenants/export - Permite descarregar pacote de dados da empresa
+router.get('/tenants/export', async (req, res, next) => {
+  const tenantId = req.user?.tenantId || req.query.tenant_id;
+  if (!tenantId) {
+    return res.status(400).json({ error: 'Tenant ID obrigatório.' });
+  }
+
+  if (req.user.role !== 'super_admin' && req.user.tenantId !== tenantId) {
+    return res.status(403).json({ error: 'Sem permissão para exportar dados desta empresa.' });
+  }
+
+  try {
+    const [tRes, aRes, woRes, fRes, pRes, mpRes] = await Promise.all([
+      pool.query('SELECT * FROM public.tenants WHERE id = $1::uuid', [tenantId]),
+      pool.query('SELECT * FROM public.assets WHERE tenant_id = $1::uuid AND deleted_at IS NULL', [tenantId]),
+      pool.query('SELECT * FROM public.work_orders WHERE tenant_id = $1::uuid', [tenantId]),
+      pool.query('SELECT * FROM public.fuel_logs WHERE tenant_id = $1::uuid', [tenantId]),
+      pool.query('SELECT * FROM public.parts WHERE tenant_id = $1::uuid', [tenantId]),
+      pool.query('SELECT * FROM public.maintenance_plans WHERE tenant_id = $1::uuid', [tenantId]),
+    ]);
+
+    return res.json({
+      export_date: new Date().toISOString(),
+      tenant: tRes.rows[0] || null,
+      assets: aRes.rows,
+      work_orders: woRes.rows,
+      fuel_logs: fRes.rows,
+      parts: pRes.rows,
+      maintenance_plans: mpRes.rows
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/tenants', requireRole(['super_admin']), async (req, res, next) => {
   try {
     const result = await withTenantContext(null, 'super_admin', (client) =>
       client.query(

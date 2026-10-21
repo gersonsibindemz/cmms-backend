@@ -40,6 +40,12 @@ router.post('/me/avatar', authenticateToken, parseAvatarUpload, async (req, res,
     return res.status(400).json({ error: 'Envie uma foto no campo "avatar".' });
   }
 
+  let oldAvatarUrl = null;
+  try {
+    const oldUserRes = await pool.query('SELECT avatar_url FROM public.app_users WHERE id = $1::uuid', [req.user.id]);
+    oldAvatarUrl = oldUserRes.rows[0]?.avatar_url;
+  } catch (e) {}
+
   let uploadedAvatar;
   try {
     uploadedAvatar = await uploadUserAvatar(req.user.id, req.file.buffer, req.file.mimetype);
@@ -57,6 +63,14 @@ router.post('/me/avatar', authenticateToken, parseAvatarUpload, async (req, res,
       await removeUserAvatar(uploadedAvatar.storagePath);
       return res.status(404).json({ error: 'Utilizador não encontrado.' });
     }
+    if (oldAvatarUrl) {
+      try {
+        await removeUserAvatar(oldAvatarUrl);
+      } catch (delErr) {
+        console.warn('Erro ao remover avatar anterior:', delErr);
+      }
+    }
+
     return res.json({
       message: 'Avatar atualizado com sucesso.',
       avatar_url: result.rows[0].avatar_url,
@@ -168,12 +182,75 @@ router.post('/login', async (req, res) => {
 });
 
 // POST /api/auth/logout
-router.post('/logout', (req, res) => {
+router.post('/logout', async (req, res) => {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.cookies?.auth_token) {
+    token = req.cookies.auth_token;
+  }
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const userId = decoded.userId || decoded.id;
+      if (userId) {
+        await pool.query(
+          `UPDATE public.app_users 
+           SET last_sign_in = NOW(), last_login_at = NOW() 
+           WHERE id = $1::uuid`,
+          [userId]
+        );
+      }
+    } catch (e) {}
+  }
+
   res.clearCookie('auth_token', {
     httpOnly: true,
     secure: IS_PROD,
     sameSite: IS_PROD ? 'none' : 'lax'
   });
+  return res.json({ message: 'Sessão encerrada com sucesso.' });
+});
+
+// POST /api/auth/record-exit (acionado no fecho de aba/janela ou reset do cookie)
+router.post('/record-exit', async (req, res) => {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.cookies?.auth_token) {
+    token = req.cookies.auth_token;
+  } else if (req.body?.token) {
+    token = req.body.token;
+  }
+
+  const userId = req.body?.userId;
+
+  try {
+    let targetUserId = userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        targetUserId = decoded.userId || decoded.id || targetUserId;
+      } catch (e) {}
+    }
+    if (targetUserId) {
+      await pool.query(
+        `UPDATE public.app_users 
+         SET last_sign_in = NOW(), last_login_at = NOW() 
+         WHERE id = $1::uuid`,
+        [targetUserId]
+      );
+      return res.json({ success: true, recorded: true });
+    }
+  } catch (err) {
+    console.error('Erro ao registar saída:', err);
+  }
+
+  return res.json({ success: true });
+});
   return res.json({ message: 'Sessão encerrada com sucesso.' });
 });
 

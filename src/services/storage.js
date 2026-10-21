@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { randomUUID } from 'node:crypto';
 
 const BUCKET_NAME = 'asset-documents';
-const USER_AVATARS_BUCKET_NAME = 'user-avatars';
+const USER_AVATARS_BUCKET_NAME = 'profile_avatars';
 const FILE_EXTENSIONS_BY_MIME_TYPE = new Map([
   ['application/pdf', '.pdf'],
   ['image/jpeg', '.jpg'],

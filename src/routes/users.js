@@ -41,7 +41,7 @@ router.get('/', async (req, res, next) => {
   try {
     let queryText = `
       SELECT u.id, u.tenant_id, t.name AS tenant_name, u.email, u.full_name,
-             u.role, u.operational_scope, u.is_active,
+             u.role, u.operational_scope, u.is_active, u.last_sign_in, u.last_login_at,
              CASE
                WHEN u.is_active IS TRUE THEN 'active'
                WHEN u.deleted_at IS NOT NULL THEN 'deleted'
@@ -93,6 +93,10 @@ router.post('/', requireSuperAdmin, async (req, res, next) => {
     role,
     operational_scope: operationalScope,
   } = req.body ?? {};
+  if (role === 'tenant_admin' && operationalScope === 'mixed') {
+    return res.status(400).json({ error: 'Gestor de Contrato (tenant_admin) não pode ter âmbito operacional misto. Selecione Frota ou Fábrica.' });
+  }
+
   if (
     typeof tenantId !== 'string' ||
     !UUID_PATTERN.test(tenantId) ||
@@ -189,6 +193,10 @@ async function updateUser(req, res, next) {
   }
 
   const { name, email, role, operational_scope: operationalScope, password } = req.body ?? {};
+  if (role === 'tenant_admin' && operationalScope === 'mixed') {
+    return res.status(400).json({ error: 'Gestor de Contrato (tenant_admin) não pode ter âmbito operacional misto. Selecione Frota ou Fábrica.' });
+  }
+
   if (
     typeof name !== 'string' ||
     !name.trim() ||

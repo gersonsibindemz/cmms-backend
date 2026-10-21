@@ -16,6 +16,7 @@ import partsRoutes from './routes/parts.js';
 import dashboardRoutes from './routes/dashboard.js';
 import maintenancePlansRouter from './routes/maintenancePlans.js';
 import fleetCombinationsRouter from './routes/fleetCombinations.js';
+import itLogsRoutes from './routes/itLogs.js';
 import { authenticateToken } from './middlewares/auth.js';
 
 const app = express();
@@ -47,6 +48,7 @@ app.use('/api/parts', partsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/maintenance-plans', maintenancePlansRouter);
 app.use('/api/fleet-combinations', authenticateToken, fleetCombinationsRouter);
+app.use('/api/it-logs', itLogsRoutes);
 
 app.use((err, req, res, next) => {
   console.error('[Unhandled Error]:', err);
