@@ -666,17 +666,22 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
 
   try {
     const asset = await withTenantContext(req.user.tenantId, req.user.role, async (client) => {
+      let scopeClause1 = '';
+      const params1 = [req.params.id, req.user.tenantId];
+      if ((req.user.role === 'supervisor' || req.user.role === 'driver_operator') && req.user.operational_scope && req.user.tenant_scope !== 'mixed') {
+        params1.push(req.user.operational_scope);
+        scopeClause1 = `AND (domain = $${params1.length} OR operational_scope = $${params1.length})`;
+      }
+
       const currentAsset = await client.query(
         `SELECT id, current_meter
          FROM public.assets
          WHERE (id::text = $1 OR code_tag = $1)
            AND tenant_id = $2
            AND deleted_at IS NULL
-           ${req.userScope ? 'AND domain = $3' : ''}
+           ${scopeClause1}
          FOR UPDATE;`,
-        req.userScope
-          ? [req.params.id, req.user.tenantId, req.userScope]
-          : [req.params.id, req.user.tenantId],
+        params1,
       );
 
       if (currentAsset.rows.length === 0) return null;
@@ -687,17 +692,22 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
         return { meterCannotDecrease: true };
       }
 
+      let scopeClause2 = '';
+      const params2 = [meterValue, currentAsset.rows[0].id, req.user.tenantId];
+      if ((req.user.role === 'supervisor' || req.user.role === 'driver_operator') && req.user.operational_scope && req.user.tenant_scope !== 'mixed') {
+        params2.push(req.user.operational_scope);
+        scopeClause2 = `AND (domain = $${params2.length} OR operational_scope = $${params2.length})`;
+      }
+
       const result = await client.query(
         `UPDATE public.assets
          SET current_meter = $1, updated_at = NOW()
          WHERE id = $2
            AND tenant_id = $3
            AND deleted_at IS NULL
-           ${req.userScope ? 'AND domain = $4' : ''}
+           ${scopeClause2}
          RETURNING *;`,
-        req.userScope
-          ? [meterValue, currentAsset.rows[0].id, req.user.tenantId, req.userScope]
-          : [meterValue, currentAsset.rows[0].id, req.user.tenantId],
+        params2,
       );
       return { asset: result.rows[0] };
     });
@@ -1400,9 +1410,9 @@ async function updateAsset(req, res) {
     const idParameter = values.length - 1;
     const tenantParameter = values.length;
     let scopeClause = '';
-    if (req.userScope) {
-      values.push(req.userScope);
-      scopeClause = `AND domain = $${values.length}`;
+    if (req.user.role === 'supervisor' && req.user.operational_scope && req.user.tenant_scope !== 'mixed') {
+      values.push(req.user.operational_scope);
+      scopeClause = `AND (domain = $${values.length} OR operational_scope = $${values.length})`;
     }
     const updateQuery = `
       UPDATE public.assets
@@ -1432,15 +1442,20 @@ router.put('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin', 's
 router.patch('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), updateAsset);
 
 // 5. SOFT-DELETE (Inativação com auditoria)
-router.delete('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin'), async (req, res) => {
+router.delete('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), async (req, res) => {
   try {
     const { id } = req.params;
     const values = [id, req.user.tenantId];
-    const scopeClause = req.userScope ? 'AND domain = $3' : '';
-    if (req.userScope) values.push(req.userScope);
+    // Se for supervisor com escopo fixo em empresa não-mista, restringe ao seu escopo.
+    // Tenant_admin e super_admin gerem e eliminam todos os ativos da empresa (frota e equipamentos fabris).
+    let scopeClause = '';
+    if (req.user.role === 'supervisor' && req.user.operational_scope && req.user.tenant_scope !== 'mixed') {
+      values.push(req.user.operational_scope);
+      scopeClause = `AND (domain = $${values.length} OR operational_scope = $${values.length})`;
+    }
     const { rows } = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
       client.query(
-        `UPDATE public.assets SET deleted_at = NOW()
+        `UPDATE public.assets SET deleted_at = NOW(), updated_at = NOW()
          WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2 ${scopeClause}
          RETURNING id, code_tag;`,
         values,
