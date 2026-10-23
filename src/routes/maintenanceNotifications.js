@@ -1,3 +1,5 @@
+import multer from 'multer';
+import { uploadMaintenancePhoto } from '../services/storage.js';
 import { Router } from 'express';
 import { withTenantContext } from '../db.js';
 import {
@@ -17,6 +19,20 @@ const MAINTENANCE_TYPES = new Set(['corrective', 'preventive', 'inspection']);
 const NOTIFICATION_STATUSES = new Set(['draft', 'pending_triage']);
 
 router.use(authenticateToken, enforceDomainScope);
+
+const uploadEvidence = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB max
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Apenas ficheiros de imagem (JPEG, PNG, WebP) são permitidos.'));
+    }
+  },
+});
+
 
 function requireTenant(req, res, next) {
   if (!req.user.tenantId) {
@@ -54,6 +70,30 @@ async function getTechnicianUserId(client, assignedTo, tenantId, domain) {
   );
   return result.rows[0]?.id ?? null;
 }
+
+
+router.post('/upload-photo', requireTenant, uploadEvidence.single('photo'), async (req, res, next) => {
+  if (!req.file || req.file.size === 0) {
+    return res.status(400).json({ error: 'Nenhum ficheiro de imagem foi enviado.' });
+  }
+
+  try {
+    const { storagePath, publicUrl } = await uploadMaintenancePhoto(
+      req.user.tenantId,
+      req.file.buffer,
+      req.file.mimetype,
+    );
+
+    return res.status(200).json({
+      success: true,
+      url: publicUrl,
+      storagePath,
+    });
+  } catch (error) {
+    console.error('Erro no upload de foto de avaria:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao processar imagem de avaria.' });
+  }
+});
 
 router.post('/', requireTenant, async (req, res, next) => {
   const {

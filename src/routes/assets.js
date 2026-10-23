@@ -533,9 +533,27 @@ router.get('/:id/documents', requireTenant, validateAssetId, async (req, res) =>
 
 // 1. LISTAR ATIVOS (Apenas os não eliminados)
 router.get('/', requireTenant, async (req, res) => {
-  const domain = req.query.domain;
-  if (domain !== undefined && !['fleet', 'plant'].includes(domain)) {
+  const { role, operational_scope } = req.user;
+  let domain = req.query.domain;
+  if (domain !== undefined && domain !== 'all' && !['fleet', 'plant'].includes(domain)) {
     return res.status(400).json({ error: 'Escopo operacional inválido.' });
+  }
+
+  // supervisor, driver_operator e technician são restritos ao seu escopo atribuído
+  if (role === 'supervisor' || role === 'driver_operator' || role === 'technician') {
+    domain = operational_scope;
+  } else if (role === 'tenant_admin') {
+    // Se tenant for mixed e a query não especificar domain (ou for 'all'),
+    // domain passa a null -> vista unificada de todo o material (frota + fábrica)!
+    if (!domain || domain === 'all') {
+      if (req.userScope && req.user.tenant_scope !== 'mixed') {
+        domain = req.userScope;
+      } else {
+        domain = null;
+      }
+    }
+  } else if (domain === 'all') {
+    domain = null;
   }
 
   try {
@@ -560,7 +578,7 @@ router.get('/', requireTenant, async (req, res) => {
         safety_checks, created_at
       FROM public.assets
       WHERE tenant_id = $1::uuid
-        AND ($2::text IS NULL OR domain = $2)
+        AND ($2::text IS NULL OR domain = $2 OR operational_scope = $2)
         AND deleted_at IS NULL
       ORDER BY created_at DESC;
     `,
@@ -585,8 +603,8 @@ router.get('/:id', requireTenant, async (req, res) => {
          WHERE (id::text = $1 OR code_tag = $1)
            AND tenant_id = $2
            AND deleted_at IS NULL
-           ${req.userScope ? 'AND domain = $3' : ''};`,
-        req.userScope ? [id, req.user.tenantId, req.userScope] : [id, req.user.tenantId],
+           ${req.user.role === 'supervisor' || req.user.role === 'driver_operator' ? 'AND (domain = $3 OR operational_scope = $3)' : (req.userScope && req.user.tenant_scope !== 'mixed' ? 'AND (domain = $3 OR operational_scope = $3)' : '')};`,
+        (req.user.role === 'supervisor' || req.user.role === 'driver_operator') ? [id, req.user.tenantId, req.user.operational_scope] : ((req.userScope && req.user.tenant_scope !== 'mixed') ? [id, req.user.tenantId, req.userScope] : [id, req.user.tenantId]),
       ),
     );
 
@@ -667,7 +685,7 @@ router.patch('/:id/meter', requireTenant, async (req, res) => {
   }
 });
 
-router.post('/bulk', requireTenant, async (req, res, next) => {
+router.post('/bulk', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), async (req, res, next) => {
   const tenantId = req.user.tenantId;
   const { userScope } = req;
   const assets = req.body?.assets;
@@ -936,9 +954,17 @@ router.post('/bulk', requireTenant, async (req, res, next) => {
 });
 
 // 3. CRIAR NOVO ATIVO (Com geração automática de código se não fornecido)
-router.post('/', requireTenant, checkTenantLimits('assets'), async (req, res) => {
+router.post('/', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), checkTenantLimits('assets'), async (req, res) => {
   try {
     const body = req.body ?? {};
+    // Regra: supervisor só adiciona ativo no seu escopo operacional
+    if (req.user.role === 'supervisor') {
+      const targetScope = domain || operationalScope;
+      if (targetScope && targetScope !== req.user.operational_scope) {
+        return res.status(403).json({ error: `Supervisor só pode adicionar ativos no escopo ${req.user.operational_scope}.` });
+      }
+    }
+
     const codeTag = assetInput(body, 'codeTag', 'code_tag', 'equipment_code', 'equipmentCode');
     const name = assetInput(body, 'name');
     const category = normalizeAssetCategory(
@@ -1355,11 +1381,11 @@ async function updateAsset(req, res) {
   }
 }
 
-router.put('/:id', requireTenant, updateAsset);
-router.patch('/:id', requireTenant, updateAsset);
+router.put('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), updateAsset);
+router.patch('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), updateAsset);
 
 // 5. SOFT-DELETE (Inativação com auditoria)
-router.delete('/:id', requireTenant, async (req, res) => {
+router.delete('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const values = [id, req.user.tenantId];

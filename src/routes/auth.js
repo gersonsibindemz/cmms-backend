@@ -107,7 +107,7 @@ router.post('/login', async (req, res) => {
               u.avatar_url,
               u.deleted_at, u.suspension_reason,
               u.operational_scope,
-              t.is_active as tenant_active, t.name as tenant_name
+              t.is_active as tenant_active, t.name as tenant_name, t.operational_scope as tenant_scope
        FROM app_users u
        LEFT JOIN tenants t ON t.id = u.tenant_id
        WHERE u.email = $1`,
@@ -173,6 +173,11 @@ router.post('/login', async (req, res) => {
         readonly_penalty: user.is_active === false,
         suspension_reason: user.suspension_reason,
         avatar_url: user.avatar_url,
+        tenant: {
+          id: user.tenant_id,
+          name: user.tenant_name,
+          operational_scope: user.tenant_scope,
+        },
       }
     });
   } catch (error) {

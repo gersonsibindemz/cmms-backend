@@ -37,7 +37,9 @@ export async function authenticateToken(req, res, next) {
       client.query(
         `SELECT users.is_active,
                 users.deleted_at,
-                tenants.is_active AS tenant_active
+                users.operational_scope,
+                tenants.is_active AS tenant_active,
+                tenants.operational_scope AS tenant_scope
          FROM public.app_users AS users
          LEFT JOIN public.tenants AS tenants ON tenants.id = users.tenant_id
          WHERE users.id = $1::uuid
@@ -58,16 +60,18 @@ export async function authenticateToken(req, res, next) {
     }
 
     const isSuspended = currentUser.is_active === false;
+    const userOperationalScope = currentUser.operational_scope || payload.operational_scope || 'fleet';
     req.user = {
       id: userId,
       tenantId: payload.tenantId,
       role: payload.role,
       fullName: payload.fullName,
-      operational_scope: payload.operational_scope,
+      operational_scope: userOperationalScope,
+      tenant_scope: currentUser.tenant_scope,
       isSuspended,
       readonly_penalty: isSuspended,
     };
-    req.userScope = req.user.operational_scope || 'fleet';
+    req.userScope = userOperationalScope;
 
     if (
       isSuspended
@@ -113,51 +117,133 @@ export function enforceDomainScope(requiredScope, res, next) {
 }
 
 function createDomainScopeMiddleware(requiredScope) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (!USER_ROLES.has(req.user.role)) {
       return res.status(403).json({ error: 'Acesso negado para o seu perfil.' });
     }
-    if (requiredScope && req.userScope !== requiredScope) {
-      return res.status(403).json({ error: 'O módulo não está disponível neste escopo operacional.' });
+
+    // super_admin mantém todos os privilégios globais intactos
+    if (req.user.role === 'super_admin') {
+      req.userScope = null;
+      return next();
     }
-    if (req.user.role === 'super_admin') return next();
 
     if (!req.user.tenantId) {
       return res.status(403).json({ error: 'A empresa do utilizador não está definida.' });
     }
-    if (!DOMAIN_SCOPES.has(req.userScope)) {
-      return res.status(403).json({ error: 'Escopo operacional inválido para este utilizador.' });
-    }
 
-    const requestedScope = req.query.domain
-      ?? req.query.operational_scope
-      ?? req.get('x-operational-scope')
-      ?? req.get('x-domain');
-    if (requestedScope !== undefined && !DOMAIN_SCOPES.has(requestedScope)) {
-      return res.status(400).json({ error: 'Escopo operacional inválido.' });
-    }
-    if (requestedScope !== undefined && requestedScope !== req.userScope) {
-      return res.status(403).json({ error: 'O escopo solicitado não corresponde ao utilizador.' });
-    }
+    try {
+      let tenantScope = req.user.tenant_scope;
+      if (!tenantScope) {
+        const result = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+          client.query(
+            `SELECT operational_scope
+             FROM public.tenants
+             WHERE id = $1::uuid`,
+            [req.user.tenantId],
+          ),
+        );
+        tenantScope = result.rows[0]?.operational_scope;
+        req.user.tenant_scope = tenantScope;
+      }
 
-    withTenantContext(req.user.tenantId, req.user.role, (client) =>
-      client.query(
-        `SELECT operational_scope, default_operational_scope
-         FROM public.tenants
-         WHERE id = $1::uuid`,
-        [req.user.tenantId],
-      ),
-    ).then((result) => {
-      const tenantScope = result.rows[0]?.operational_scope;
       if (!tenantScope) {
         return res.status(403).json({ error: 'Escopo operacional do tenant não definido.' });
       }
 
-      if (tenantScope !== 'mixed' && req.userScope !== tenantScope) {
-        return res.status(403).json({ error: 'O escopo do utilizador não está disponível neste tenant.' });
+      const requestedScope = req.query.domain
+        ?? req.query.operational_scope
+        ?? req.get('x-operational-scope')
+        ?? req.get('x-domain');
+
+      if (
+        requestedScope !== undefined &&
+        requestedScope !== 'all' &&
+        !DOMAIN_SCOPES.has(requestedScope)
+      ) {
+        return res.status(400).json({ error: 'Escopo operacional inválido.' });
       }
+
+      // Validação se a rota exige um escopo fixo específico (ex: /fuel exige fleet)
+      if (requiredScope) {
+        if (req.user.role === 'tenant_admin') {
+          if (tenantScope !== 'mixed' && tenantScope !== requiredScope) {
+            return res.status(403).json({ error: 'O módulo não está disponível para o escopo da sua empresa.' });
+          }
+          req.userScope = requiredScope;
+          return next();
+        }
+
+        if (req.user.operational_scope !== requiredScope) {
+          return res.status(403).json({ error: 'O módulo não está disponível no seu escopo operacional.' });
+        }
+        req.userScope = requiredScope;
+        return next();
+      }
+
+      // 1. tenant_admin:
+      // Visualiza e gere todos os operational_scope configurados para a sua empresa (frota, fábrica/fabril, ou ambos se mixed).
+      if (req.user.role === 'tenant_admin') {
+        if (tenantScope === 'mixed') {
+          if (requestedScope && DOMAIN_SCOPES.has(requestedScope)) {
+            req.userScope = requestedScope;
+          } else {
+            req.userScope = null; // Unificado: acede a frota e fábrica simultaneamente
+          }
+          return next();
+        }
+
+        // Se tenant opera exclusivamente em um escopo
+        if (requestedScope && requestedScope !== tenantScope && requestedScope !== 'all') {
+          return res.status(403).json({ error: 'O escopo solicitado não está configurado para a sua empresa.' });
+        }
+        req.userScope = tenantScope;
+        return next();
+      }
+
+      // 2. supervisor:
+      // Visualiza e pode adicionar ativos exclusivamente dentro do operational_scope que lhe foi atribuído
+      if (req.user.role === 'supervisor') {
+        const userScope = req.user.operational_scope;
+        if (!DOMAIN_SCOPES.has(userScope)) {
+          return res.status(403).json({ error: 'Escopo operacional inválido para o supervisor.' });
+        }
+        if (tenantScope !== 'mixed' && tenantScope !== userScope) {
+          return res.status(403).json({ error: 'O escopo do supervisor não está disponível neste tenant.' });
+        }
+        if (requestedScope && requestedScope !== userScope && requestedScope !== 'all') {
+          return res.status(403).json({ error: 'Não tem permissão para aceder a recursos fora do seu escopo de supervisor.' });
+        }
+        req.userScope = userScope;
+        return next();
+      }
+
+      // 3. technician:
+      // Visualiza ordens no seu escopo
+      if (req.user.role === 'technician') {
+        const userScope = req.user.operational_scope;
+        if (requestedScope && requestedScope !== userScope && requestedScope !== 'all') {
+          return res.status(403).json({ error: 'O escopo solicitado não corresponde ao seu utilizador.' });
+        }
+        req.userScope = userScope;
+        return next();
+      }
+
+      // 4. driver_operator:
+      // Apenas actua no escopo operacional designado
+      if (req.user.role === 'driver_operator') {
+        const userScope = req.user.operational_scope;
+        if (requestedScope && requestedScope !== userScope && requestedScope !== 'all') {
+          return res.status(403).json({ error: 'O escopo solicitado não corresponde ao seu utilizador.' });
+        }
+        req.userScope = userScope;
+        return next();
+      }
+
       return next();
-    }).catch(next);
+    } catch (err) {
+      return next(err);
+    }
   };
 }
 

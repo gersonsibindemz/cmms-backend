@@ -99,3 +99,23 @@ export async function removeUserAvatar(filePath) {
 
   if (error) throw error;
 }
+
+const MAINTENANCE_EVIDENCE_BUCKET = 'maintenance-evidence';
+
+export async function uploadMaintenancePhoto(tenantId, fileBuffer, mimeType) {
+  const fileExtension = FILE_EXTENSIONS_BY_MIME_TYPE.get(mimeType);
+  if (!fileExtension || fileExtension === '.pdf') {
+    throw new Error('Tipo MIME não permitido para fotos de anomalia. Apenas imagens JPEG, PNG ou WebP são aceites.');
+  }
+
+  const storagePath = `${tenantId}/${Date.now()}-${randomUUID()}${fileExtension}`;
+  const storage = getSupabaseClient().storage.from(MAINTENANCE_EVIDENCE_BUCKET);
+  const { error } = await storage.upload(storagePath, fileBuffer, {
+    contentType: mimeType,
+    upsert: false,
+  });
+
+  if (error) throw error;
+  const { data } = storage.getPublicUrl(storagePath);
+  return { storagePath, publicUrl: data.publicUrl };
+}

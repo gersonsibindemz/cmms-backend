@@ -239,9 +239,29 @@ async function saveWorkOrderParts(client, {
 }
 
 router.get('/', requireTenant, async (req, res, next) => {
-  const { role, tenantId } = req.user;
+  const { role, tenantId, id: userId, operational_scope } = req.user;
+
+  // driver_operator: Não tem permissão para aceder a áreas de gestão ou listagem geral de OS
+  if (role === 'driver_operator') {
+    return res.status(403).json({ message: 'Acesso negado para o seu perfil. Condutores/operadores não têm acesso à gestão de ordens de serviço.' });
+  }
+
   const filters = [];
   const values = [tenantId];
+
+  // technician: Visualiza EXCLUSIVAMENTE as Ordens de Serviço atribuídas diretamente à sua pessoa
+  if (role === 'technician') {
+    values.push(userId);
+    filters.push(`(wo.assigned_to = ${values.length}::uuid OR tech.user_id = ${values.length}::uuid)`);
+  } else if (role === 'supervisor') {
+    // supervisor: Visualiza exclusivamente dentro do seu operational_scope
+    values.push(operational_scope);
+    filters.push(`(wo.domain = ${values.length} OR a.domain = ${values.length} OR a.operational_scope = ${values.length})`);
+  } else if (req.userScope) {
+    // tenant_admin com escopo específico ativo
+    values.push(req.userScope);
+    filters.push(`(wo.domain = ${values.length} OR a.domain = ${values.length} OR a.operational_scope = ${values.length})`);
+  }
 
   for (const [queryKey, column] of [
     ['status', 'wo.status'],
@@ -312,6 +332,9 @@ router.get('/', requireTenant, async (req, res, next) => {
 });
 
 router.get('/:id', requireTenant, async (req, res, next) => {
+  if (req.user.role === 'driver_operator') {
+    return res.status(403).json({ message: 'Acesso negado para o seu perfil.' });
+  }
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
   }
@@ -351,6 +374,18 @@ router.get('/:id', requireTenant, async (req, res, next) => {
 
       const order = result.rows[0];
       if (!order) return null;
+
+      // Restrição estrita de visualização por perfil
+      if (req.user.role === 'technician') {
+        const isAssigned = (order.assigned_to === req.user.id) || (order.technician?.user_id === req.user.id);
+        if (!isAssigned) return { forbidden: true };
+      }
+      if (req.user.role === 'supervisor') {
+        const orderScope = order.domain || order.asset?.domain || order.asset?.operational_scope;
+        if (orderScope && orderScope !== req.user.operational_scope) {
+          return { forbidden: true };
+        }
+      }
       order.parts = await getWorkOrderParts(
         client,
         req.user.tenantId,
@@ -362,6 +397,9 @@ router.get('/:id', requireTenant, async (req, res, next) => {
 
     if (!workOrder) {
       return res.status(404).json({ message: 'Ordem de serviço não encontrada.' });
+    }
+    if (workOrder.forbidden) {
+      return res.status(403).json({ message: 'Acesso negado a esta ordem de serviço.' });
     }
     return res.json({ workOrder });
   } catch (error) {
@@ -590,7 +628,24 @@ router.get('/:id/timeline', requireTenant, async (req, res, next) => {
   }
 });
 
-router.post('/', requireTenant, async (req, res, next) => {
+router.post('/', requireTenant, requireRoles('super_admin', 'tenant_admin', 'supervisor'), async (req, res, next) => {
+  if (req.user.role === 'supervisor') {
+    const assetCheck = await withTenantContext(req.user.tenantId, req.user.role, (client) =>
+      client.query(
+        'SELECT id, domain, operational_scope FROM public.assets WHERE id = $1::uuid AND tenant_id = $2::uuid AND deleted_at IS NULL',
+        [req.body?.assetId, req.user.tenantId]
+      )
+    );
+    const assetRow = assetCheck.rows[0];
+    if (!assetRow) {
+      return res.status(404).json({ message: 'Ativo não encontrado.' });
+    }
+    const assetScope = assetRow.domain || assetRow.operational_scope;
+    if (assetScope && assetScope !== req.user.operational_scope) {
+      return res.status(403).json({ message: 'Não tem permissão para abrir ordens de serviço fora do seu escopo operacional.' });
+    }
+  }
+
   const {
     assetId,
     title,
@@ -740,6 +795,9 @@ router.post('/', requireTenant, async (req, res, next) => {
 });
 
 async function updateWorkOrder(req, res, next) {
+  if (req.user.role === 'driver_operator') {
+    return res.status(403).json({ message: 'Acesso negado para o seu perfil.' });
+  }
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
   }
@@ -952,7 +1010,7 @@ async function updateWorkOrder(req, res, next) {
 router.put('/:id', requireTenant, updateWorkOrder);
 router.patch('/:id', requireTenant, updateWorkOrder);
 
-router.delete('/:id', requireTenant, async (req, res, next) => {
+router.delete('/:id', requireTenant, requireRoles('super_admin', 'tenant_admin'), async (req, res, next) => {
   if (!UUID_PATTERN.test(req.params.id)) {
     return res.status(400).json({ message: 'Identificador da ordem de serviço inválido.' });
   }
