@@ -104,6 +104,20 @@ const ASSET_FORM_FIELDS = [
   { key: 'next_inspection_date', type: 'date' },
   { key: 'maintenance_plan_id', type: 'uuid' },
   { key: 'maintenance_type', type: 'string' },
+  { key: 'qr_code', type: 'string' },
+  { key: 'photo_url', type: 'string' },
+  { key: 'company', type: 'string' },
+  { key: 'location', type: 'string' },
+  { key: 'responsible', type: 'string' },
+  { key: 'notes', type: 'string' },
+  { key: 'maintenance_periodicity', type: 'string' },
+  { key: 'last_maintenance_date', type: 'date' },
+  { key: 'last_maintenance_meter', type: 'nonnegative-number' },
+  { key: 'next_maintenance_meter', type: 'nonnegative-number' },
+  { key: 'maintenance_notes', type: 'string' },
+  { key: 'general_condition', type: 'string' },
+  { key: 'expected_operating_hours', type: 'nonnegative-number' },
+  { key: 'last_reading_date', type: 'date' },
 ];
 const ASSET_FORM_FIELD_ALIASES = {
   equipment_code: ['equipmentCode'],
@@ -129,6 +143,20 @@ const ASSET_FORM_FIELD_ALIASES = {
   next_inspection_date: ['nextInspectionDate'],
   maintenance_plan_id: ['maintenancePlanId'],
   maintenance_type: ['maintenanceType'],
+  qr_code: ['qrCode', 'qrCodeTag', 'qr_code_tag'],
+  photo_url: ['photoUrl', 'assetPhoto', 'asset_photo', 'imageUrl', 'image_url'],
+  company: ['companyName', 'company_name'],
+  location: ['baseLocation', 'base_location', 'base'],
+  responsible: ['responsavel', 'assetResponsible', 'asset_responsible'],
+  notes: ['observacoes', 'observations', 'operationalNotes', 'operational_notes'],
+  maintenance_periodicity: ['maintenancePeriodicity', 'periodicity'],
+  last_maintenance_date: ['lastMaintenanceDate'],
+  last_maintenance_meter: ['lastMaintenanceMeter'],
+  next_maintenance_meter: ['nextMaintenanceMeter'],
+  maintenance_notes: ['maintenanceNotes'],
+  general_condition: ['generalCondition', 'assetCondition'],
+  expected_operating_hours: ['expectedOperatingHours'],
+  last_reading_date: ['lastReadingDate', 'lastMeterReadingDate', 'last_meter_reading_date'],
 };
 const INVALID_ASSET_CATEGORY_ERROR =
   'Categoria inválida. Use uma categoria válida ou um código/rótulo de categoria reconhecido.';
@@ -575,7 +603,10 @@ router.get('/', requireTenant, async (req, res) => {
         fuel_tank_capacity_liters::double precision AS fuel_tank_capacity_liters,
         plant_sector, voltage_specs, power_kw_kva, innoq_calibration_expiry,
         pressure_test_expiry, local_supplier_name, warranty_expiry, technical_specs,
-        safety_checks, created_at
+        safety_checks, qr_code, photo_url, company, location, responsible, notes,
+        maintenance_periodicity, last_maintenance_date, last_maintenance_meter,
+        next_maintenance_meter, maintenance_notes, general_condition,
+        expected_operating_hours, last_reading_date, created_at
       FROM public.assets
       WHERE tenant_id = $1::uuid
         AND ($2::text IS NULL OR domain = $2 OR operational_scope = $2)
@@ -1073,7 +1104,9 @@ router.post('/', requireTenant, requireRoles('super_admin', 'tenant_admin', 'sup
       return res.status(400).json({ error: 'Dados do ativo inválidos.' });
     }
 
-    const assetDomain = req.userScope;
+    const domainFromBody = req.body?.domain || req.body?.operational_scope;
+    const isPlantCat = ['generator', 'machinery', 'plant_equipment'].includes(category);
+    const assetDomain = req.userScope || domainFromBody || (isPlantCat ? 'plant' : 'fleet');
     if (!['fleet', 'plant'].includes(assetDomain)) {
       return res.status(400).json({ error: 'Domínio do ativo inválido.' });
     }
@@ -1193,6 +1226,20 @@ async function updateAsset(req, res) {
       ['pressureTestExpiry', 'pressure_test_expiry'],
       ['localSupplierName', 'local_supplier_name'],
       ['warrantyExpiry', 'warranty_expiry'],
+      ['qrCode', 'qr_code'],
+      ['photoUrl', 'photo_url'],
+      ['company', 'company'],
+      ['location', 'location'],
+      ['responsible', 'responsible'],
+      ['notes', 'notes'],
+      ['maintenancePeriodicity', 'maintenance_periodicity'],
+      ['lastMaintenanceDate', 'last_maintenance_date'],
+      ['lastMaintenanceMeter', 'last_maintenance_meter'],
+      ['nextMaintenanceMeter', 'next_maintenance_meter'],
+      ['maintenanceNotes', 'maintenance_notes'],
+      ['generalCondition', 'general_condition'],
+      ['expectedOperatingHours', 'expected_operating_hours'],
+      ['lastReadingDate', 'last_reading_date'],
     ];
 
     const values = [];
